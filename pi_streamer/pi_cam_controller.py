@@ -400,15 +400,112 @@ class CameraStreamer:
         self.start()
 
 
+class StreamSupervisor:
+    def __init__(
+        self,
+        streamer: CameraStreamer,
+        retry_initial: float = 2.0,
+        retry_max: float = 30.0,
+    ) -> None:
+        self._streamer = streamer
+        self._retry_initial = retry_initial
+        self._retry_max = retry_max
+        self._retry_delay = retry_initial
+        self._desired_running = False
+        self._stop_event = threading.Event()
+        self._wakeup = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="stream-supervisor", daemon=True)
+        self._lock = threading.RLock()
+
+    @property
+    def desired_running(self) -> bool:
+        with self._lock:
+            return self._desired_running
+
+    def start(self, autostart: bool = False) -> None:
+        with self._lock:
+            self._desired_running = autostart
+            self._retry_delay = self._retry_initial
+        self._thread.start()
+        if autostart:
+            self._wakeup.set()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._desired_running = False
+        self._stop_event.set()
+        self._wakeup.set()
+        self._streamer.stop()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
+
+    def request_start(self) -> None:
+        with self._lock:
+            self._desired_running = True
+            self._retry_delay = self._retry_initial
+        LOG.info("stream desired state set to running")
+        self._wakeup.set()
+
+    def request_stop(self) -> None:
+        with self._lock:
+            self._desired_running = False
+            self._retry_delay = self._retry_initial
+        LOG.info("stream desired state set to stopped")
+        self._streamer.stop()
+        self._wakeup.set()
+
+    def request_restart(self) -> None:
+        with self._lock:
+            self._desired_running = True
+            self._retry_delay = self._retry_initial
+        LOG.info("stream restart requested")
+        self._streamer.stop()
+        self._wakeup.set()
+
+    def apply_settings(self, changes: dict[str, Any]) -> bool:
+        restart_required = self._streamer.update_settings(**changes)
+        if restart_required and self.desired_running:
+            LOG.info("stream settings changed, scheduling restart")
+            self._streamer.stop()
+            with self._lock:
+                self._retry_delay = self._retry_initial
+            self._wakeup.set()
+        return restart_required
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if self.desired_running and self._streamer.state in ("stopped", "error"):
+                try:
+                    self._streamer.start()
+                    with self._lock:
+                        self._retry_delay = self._retry_initial
+                    self._wakeup.wait(1.0)
+                    self._wakeup.clear()
+                    continue
+                except Exception as exc:
+                    with self._lock:
+                        delay = self._retry_delay
+                        self._retry_delay = min(self._retry_delay * 2.0, self._retry_max)
+                    LOG.warning("stream start failed, retrying in %.1fs: %s", delay, exc)
+                    self._wakeup.wait(delay)
+                    self._wakeup.clear()
+                    continue
+
+            self._wakeup.wait(1.0)
+            self._wakeup.clear()
+
+
 class MqttController:
-    def __init__(self, mqtt_settings: MqttSettings, streamer: CameraStreamer) -> None:
+    def __init__(self, mqtt_settings: MqttSettings, streamer: CameraStreamer, supervisor: StreamSupervisor) -> None:
         self._mqtt_settings = mqtt_settings
         self._streamer = streamer
+        self._supervisor = supervisor
         self._client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=mqtt_settings.client_id,
             protocol=mqtt.MQTTv311,
         )
+        self._client.reconnect_delay_set(min_delay=1, max_delay=30)
         if mqtt_settings.username:
             self._client.username_pw_set(mqtt_settings.username, mqtt_settings.password)
         self._client.on_connect = self._on_connect
@@ -433,6 +530,7 @@ class MqttController:
         self._publish("status/error", self._streamer.last_error, retain=True)
         self._publish("status/config", json.dumps(asdict(self._streamer.settings)), retain=True)
         self._publish("status/target", self._streamer.describe_target(), retain=True)
+        self._publish("status/desired", "running" if self._supervisor.desired_running else "stopped", retain=True)
 
     def _on_connect(self, client: mqtt.Client, userdata: Any, flags: Any, reason_code: Any, properties: Any) -> None:
         LOG.info("mqtt connected: %s", reason_code)
@@ -456,9 +554,7 @@ class MqttController:
         changes = {key: value for key, value in payload.items() if key in allowed}
         if not changes:
             raise ValueError("no valid stream settings in payload")
-        restart_required = self._streamer.update_settings(**changes)
-        if restart_required and self._streamer.state == "running":
-            self._streamer.restart()
+        self._supervisor.apply_settings(changes)
         self._publish_status()
 
     def _on_message(self, client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
@@ -468,11 +564,11 @@ class MqttController:
 
         try:
             if topic == self._topic("cmd/start"):
-                self._streamer.start()
+                self._supervisor.request_start()
             elif topic == self._topic("cmd/stop"):
-                self._streamer.stop()
+                self._supervisor.request_stop()
             elif topic == self._topic("cmd/restart"):
-                self._streamer.restart()
+                self._supervisor.request_restart()
             elif topic == self._topic("cmd/ping"):
                 self._publish("status/pong", payload_text or "pong", retain=True)
             elif topic == self._topic("cmd/set"):
@@ -490,12 +586,12 @@ class MqttController:
 
     def start(self) -> None:
         self._client.will_set(self._topic("status/online"), payload="false", qos=1, retain=True)
-        self._client.connect(self._mqtt_settings.host, self._mqtt_settings.port, self._mqtt_settings.keepalive)
+        self._client.connect_async(self._mqtt_settings.host, self._mqtt_settings.port, self._mqtt_settings.keepalive)
         self._client.loop_start()
 
     def stop(self) -> None:
-        self._client.loop_stop()
         self._client.disconnect()
+        self._client.loop_stop()
 
 
 def load_config(path: Path) -> tuple[StreamSettings, MqttSettings]:
@@ -519,20 +615,20 @@ def main() -> None:
     config_path = Path(args.config).resolve()
     stream_settings, mqtt_settings = load_config(config_path)
     streamer = CameraStreamer(stream_settings, config_path)
-    controller = MqttController(mqtt_settings, streamer)
+    supervisor = StreamSupervisor(streamer)
+    controller = MqttController(mqtt_settings, streamer, supervisor)
     streamer.set_status_listener(controller.publish_streamer_status)
 
     try:
         controller.start()
-        if args.autostart:
-            streamer.start()
+        supervisor.start(autostart=args.autostart)
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         LOG.info("shutting down")
     finally:
         controller.stop()
-        streamer.stop()
+        supervisor.stop()
 
 
 if __name__ == "__main__":
