@@ -111,6 +111,9 @@ class CameraStreamer:
     def describe_target(self) -> str:
         return self.settings.target_url()
 
+    def _is_stopping(self) -> bool:
+        return self._stop_requested.is_set()
+
     def update_settings(self, **changes: Any) -> bool:
         restart_required = False
         with self._lock:
@@ -221,24 +224,31 @@ class CameraStreamer:
         assert self._capture_process.stdout is not None
         assert self._socket is not None
 
+        capture_stdout = self._capture_process.stdout
+        sock = self._socket
+
         try:
-            while not self._stop_requested.is_set():
-                chunk = self._capture_process.stdout.read(64 * 1024)
+            while not self._is_stopping():
+                chunk = capture_stdout.read(64 * 1024)
                 if not chunk:
                     break
-                self._socket.sendall(chunk)
-        except (BrokenPipeError, ConnectionError, OSError) as exc:
+                sock.sendall(chunk)
+        except (BrokenPipeError, ConnectionError, OSError, ValueError) as exc:
+            if self._is_stopping():
+                LOG.info("tcp transport stopped cleanly")
+                return
             LOG.error("tcp transport failed: %s", exc)
             self._stop_after_failure(f"tcp transport: {exc}")
             return
 
-        if not self._stop_requested.is_set():
+        if self._is_stopping():
+            return
+
+        if not self._is_stopping():
             code = self._capture_process.poll()
             reason = f"capture exited with code {code}" if code not in (None, 0) else "tcp stream ended"
             self._stop_after_failure(reason)
             return
-
-        self.stop()
 
     def _pump_stdout_to_rtsp(self) -> None:
         assert self._capture_process is not None
@@ -246,27 +256,36 @@ class CameraStreamer:
         assert self._ffmpeg_process is not None
         assert self._ffmpeg_process.stdin is not None
 
+        capture_stdout = self._capture_process.stdout
+        ffmpeg_process = self._ffmpeg_process
+        ffmpeg_stdin = ffmpeg_process.stdin
+
         try:
-            while not self._stop_requested.is_set():
-                chunk = self._capture_process.stdout.read(64 * 1024)
+            while not self._is_stopping():
+                chunk = capture_stdout.read(64 * 1024)
                 if not chunk:
                     break
-                self._ffmpeg_process.stdin.write(chunk)
-                self._ffmpeg_process.stdin.flush()
-        except (BrokenPipeError, OSError) as exc:
+                ffmpeg_stdin.write(chunk)
+                ffmpeg_stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            if self._is_stopping():
+                LOG.info("rtsp publisher stopped cleanly")
+                return
             LOG.error("ffmpeg transport failed: %s", exc)
             self._stop_after_failure(f"ffmpeg transport: {exc}")
             return
         finally:
             try:
-                if self._ffmpeg_process is not None and self._ffmpeg_process.stdin is not None:
-                    self._ffmpeg_process.stdin.close()
-            except OSError:
+                ffmpeg_stdin.close()
+            except (OSError, ValueError):
                 pass
 
-        if not self._stop_requested.is_set():
+        if self._is_stopping():
+            return
+
+        if not self._is_stopping():
             capture_code = self._capture_process.poll()
-            ffmpeg_code = self._ffmpeg_process.poll()
+            ffmpeg_code = ffmpeg_process.poll()
             if ffmpeg_code not in (None, 0):
                 self._stop_after_failure(f"ffmpeg exited with code {ffmpeg_code}")
                 return
@@ -275,8 +294,6 @@ class CameraStreamer:
                 return
             self._stop_after_failure("rtsp stream ended")
             return
-
-        self.stop()
 
     def start(self) -> None:
         with self._lock:
@@ -375,10 +392,7 @@ class CameraStreamer:
             if previous_state != "error":
                 self._state = "stopped"
                 self._last_error = ""
-        if previous_state != "error":
-            self._notify_status()
-        else:
-            self._notify_status()
+        self._notify_status()
 
     def restart(self) -> None:
         self.stop()
