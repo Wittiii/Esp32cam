@@ -82,8 +82,6 @@ class CameraStreamer:
         self._timelapse_process: subprocess.Popen[bytes] | None = None
         self._socket: socket.socket | None = None
         self._stdout_thread: threading.Thread | None = None
-        self._timelapse_thread: threading.Thread | None = None
-        self._timelapse_stop_requested = threading.Event()
         self._stop_requested = threading.Event()
         self._lock = threading.RLock()
         self._status_listener: StatusListener | None = None
@@ -222,21 +220,33 @@ class CameraStreamer:
         self._notify_status()
         return restart_required
 
-    def enable_timelapse(self) -> None:
-        self.update_timelapse_settings(enabled=True)
+    def enable_timelapse(self) -> bool:
+        restart_required = self.update_timelapse_settings(enabled=True)
         if self._timelapse_capacity_reached():
             self.update_timelapse_settings(enabled=False)
             self._set_timelapse_state("storage_full", "timelapse storage limit reached")
-            return
+            return False
+
+        if self.settings.mode == "mediamtx_rtsp":
+            if self.state == "running":
+                self._set_timelapse_state("starting")
+            else:
+                self._set_timelapse_state("stopped")
+            return restart_required
 
         if self.state == "running":
             self._ensure_timelapse_process()
         else:
             self._set_timelapse_state("stopped")
+        return restart_required
 
-    def disable_timelapse(self) -> None:
-        self.update_timelapse_settings(enabled=False)
+    def disable_timelapse(self) -> bool:
+        restart_required = self.update_timelapse_settings(enabled=False)
+        if self.settings.mode == "mediamtx_rtsp":
+            self._set_timelapse_state("stopped")
+            return restart_required
         self._stop_timelapse_process(set_state="stopped")
+        return restart_required
 
     def _write_config(self) -> None:
         current = {}
@@ -273,6 +283,8 @@ class CameraStreamer:
             str(settings.saturation),
             "--codec",
             settings.codec,
+            "--intra",
+            str(max(1, settings.framerate)),
             "-o",
             "-",
         ]
@@ -284,7 +296,7 @@ class CameraStreamer:
 
     def _build_publish_command(self) -> list[str]:
         settings = self.settings
-        return [
+        command = [
             settings.ffmpeg_path,
             "-loglevel",
             "warning",
@@ -301,14 +313,46 @@ class CameraStreamer:
             "-i",
             "pipe:0",
             "-an",
-            "-c:v",
-            "copy",
-            "-rtsp_transport",
-            settings.transport,
-            "-f",
-            "rtsp",
-            settings.target_url(),
         ]
+
+        command.extend(
+            [
+                "-map",
+                "0:v",
+                "-c:v",
+                "copy",
+                "-rtsp_transport",
+                settings.transport,
+                "-f",
+                "rtsp",
+                settings.target_url(),
+            ]
+        )
+
+        timelapse = self.timelapse_settings
+        if timelapse.enabled:
+            output_dir = self.timelapse_output_dir()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            pattern = str(output_dir / "frame-%Y%m%d-%H%M%S.jpg")
+            command.extend(
+                [
+                    "-map",
+                    "0:v",
+                    "-vf",
+                    f"fps=1/{max(1, timelapse.interval_seconds)}",
+                    "-fps_mode",
+                    "vfr",
+                    "-q:v",
+                    str(max(2, min(31, timelapse.jpeg_quality))),
+                    "-strftime",
+                    "1",
+                    "-f",
+                    "image2",
+                    pattern,
+                ]
+            )
+
+        return command
 
     def _build_timelapse_command(self) -> list[str]:
         stream = self.settings
@@ -344,32 +388,6 @@ class CameraStreamer:
             "-f",
             "image2",
             pattern,
-        ]
-
-    def _next_timelapse_output_path(self) -> Path:
-        output_dir = self.timelapse_output_dir()
-        output_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-        return output_dir / f"frame-{stamp}.jpg"
-
-    def _build_timelapse_snapshot_command(self, output_path: Path) -> list[str]:
-        stream = self.settings
-        timelapse = self.timelapse_settings
-        return [
-            stream.ffmpeg_path,
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-rtsp_transport",
-            stream.transport,
-            "-i",
-            stream.target_url(),
-            "-frames:v",
-            "1",
-            "-q:v",
-            str(max(2, min(31, timelapse.jpeg_quality))),
-            "-y",
-            str(output_path),
         ]
 
     def _open_socket(self) -> socket.socket:
@@ -433,21 +451,13 @@ class CameraStreamer:
             self._set_timelapse_state("stopped")
             return
         if self.settings.mode == "mediamtx_rtsp":
-            if self._timelapse_thread is not None and self._timelapse_thread.is_alive():
-                return
-        elif self._timelapse_process is not None:
+            self._set_timelapse_state("running" if self._publish_process is not None else "starting")
+            return
+        if self._timelapse_process is not None:
             return
         if self._timelapse_capacity_reached():
             self.update_timelapse_settings(enabled=False)
             self._set_timelapse_state("storage_full", "timelapse storage limit reached")
-            return
-
-        if self.settings.mode == "mediamtx_rtsp":
-            LOG.info("starting timelapse snapshot worker for %s", self.settings.target_url())
-            self._timelapse_stop_requested.clear()
-            self._timelapse_thread = threading.Thread(target=self._run_timelapse_snapshot_loop, daemon=True)
-            self._timelapse_thread.start()
-            self._set_timelapse_state("running")
             return
 
         command = self._build_timelapse_command()
@@ -467,9 +477,6 @@ class CameraStreamer:
         self._set_timelapse_state("running")
 
     def _stop_timelapse_process(self, set_state: str | None = None, error: str = "") -> None:
-        self._timelapse_stop_requested.set()
-        timelapse_thread = self._timelapse_thread
-        self._timelapse_thread = None
         process = self._timelapse_process
         self._timelapse_process = None
         if process is not None:
@@ -484,9 +491,6 @@ class CameraStreamer:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
-
-        if timelapse_thread is not None and timelapse_thread.is_alive() and threading.current_thread() is not timelapse_thread:
-            timelapse_thread.join(timeout=5)
 
         if set_state is not None:
             self._set_timelapse_state(set_state, error)
@@ -536,75 +540,6 @@ class CameraStreamer:
             LOG.warning("timelapse storage limit reached, stopping timelapse capture")
             self.update_timelapse_settings(enabled=False)
             self._stop_timelapse_process(set_state="storage_full", error="timelapse storage limit reached")
-
-    def _run_timelapse_snapshot_loop(self) -> None:
-        interval_seconds = max(1, self.timelapse_settings.interval_seconds)
-        next_capture_at = time.monotonic() + min(5, interval_seconds)
-
-        try:
-            while not self._is_stopping() and not self._timelapse_stop_requested.is_set():
-                wait_seconds = max(0.0, next_capture_at - time.monotonic())
-                if self._timelapse_stop_requested.wait(wait_seconds):
-                    break
-
-                if self._timelapse_capacity_reached():
-                    LOG.warning("timelapse storage limit reached, stopping timelapse capture")
-                    self.update_timelapse_settings(enabled=False)
-                    self._set_timelapse_state("storage_full", "timelapse storage limit reached")
-                    break
-
-                output_path = self._next_timelapse_output_path()
-                command = self._build_timelapse_snapshot_command(output_path)
-                LOG.info("capturing timelapse frame: %s", output_path.name)
-
-                process: subprocess.Popen[bytes] | None = None
-                try:
-                    process = subprocess.Popen(
-                        command,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                        bufsize=0,
-                    )
-                    with self._lock:
-                        self._timelapse_process = process
-
-                    _, stderr = process.communicate(timeout=20)
-                    with self._lock:
-                        if self._timelapse_process is process:
-                            self._timelapse_process = None
-
-                    stderr_text = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
-                    if process.returncode != 0:
-                        message = stderr_text or f"timelapse snapshot failed with code {process.returncode}"
-                        LOG.warning(message)
-                        self._set_timelapse_state("running", message)
-                    else:
-                        self._set_timelapse_state("running")
-                        if self._refresh_timelapse_storage(force=True):
-                            self._notify_status()
-                except subprocess.TimeoutExpired:
-                    if process is not None:
-                        process.kill()
-                        with self._lock:
-                            if self._timelapse_process is process:
-                                self._timelapse_process = None
-                    self._set_timelapse_state("running", "timelapse snapshot timeout")
-                except Exception as exc:
-                    with self._lock:
-                        if self._timelapse_process is process:
-                            self._timelapse_process = None
-                    LOG.warning("timelapse snapshot failed: %s", exc)
-                    self._set_timelapse_state("running", str(exc))
-
-                interval_seconds = max(1, self.timelapse_settings.interval_seconds)
-                next_capture_at += interval_seconds
-                if next_capture_at < time.monotonic():
-                    next_capture_at = time.monotonic() + interval_seconds
-        finally:
-            with self._lock:
-                self._timelapse_process = None
-                if threading.current_thread() is self._timelapse_thread:
-                    self._timelapse_thread = None
 
     def _stop_after_failure(self, reason: str) -> None:
         self._set_stream_state("error", reason)
@@ -714,6 +649,11 @@ class CameraStreamer:
             for thread in stderr_threads:
                 thread.start()
             self._set_stream_state("running")
+            if self.settings.mode == "mediamtx_rtsp":
+                if self.timelapse_settings.enabled:
+                    self._set_timelapse_state("running")
+                else:
+                    self._set_timelapse_state("stopped")
 
     def _cleanup_stream_handles(self) -> None:
         if self._socket is not None:
@@ -752,7 +692,7 @@ class CameraStreamer:
             self._stop_requested.set()
             previous_state = self._stream_state
             self._cleanup_stream_handles()
-            self._stop_timelapse_process(set_state="stopped" if not self.timelapse_settings.enabled else self.timelapse_state)
+            self._stop_timelapse_process(set_state="stopped")
             if previous_state != "error":
                 self._stream_state = "stopped"
                 self._stream_error = ""
@@ -938,7 +878,16 @@ class MqttController:
         changes = {key: value for key, value in payload.items() if key in allowed and key != "enabled"}
         if not changes:
             raise ValueError("no valid timelapse settings in payload")
-        self._streamer.update_timelapse_settings(**changes)
+        restart_required = self._streamer.update_timelapse_settings(**changes)
+        if self._streamer.settings.mode == "mediamtx_rtsp":
+            if self._streamer.timelapse_settings.enabled:
+                self._streamer._set_timelapse_state("starting" if self._streamer.state == "running" else "stopped")
+            else:
+                self._streamer._set_timelapse_state("stopped")
+            if restart_required and self._supervisor.desired_running:
+                self._supervisor.request_restart()
+            return
+
         if self._streamer.timelapse_settings.enabled and self._streamer.state == "running":
             self._streamer.disable_timelapse()
             self._streamer.enable_timelapse()
@@ -946,6 +895,7 @@ class MqttController:
     def _on_message(self, client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
         topic = message.topic
         payload_text = message.payload.decode("utf-8", errors="replace").strip()
+        is_timelapse_command = topic.startswith(self._topic("cmd/timelapse/"))
         LOG.info("mqtt message topic=%s payload=%s", topic, payload_text)
 
         try:
@@ -963,9 +913,13 @@ class MqttController:
                     raise ValueError("payload must be a JSON object")
                 self._handle_stream_set(payload)
             elif topic == self._topic("cmd/timelapse/start"):
-                self._streamer.enable_timelapse()
+                restart_required = self._streamer.enable_timelapse()
+                if restart_required and self._streamer.settings.mode == "mediamtx_rtsp" and self._supervisor.desired_running:
+                    self._supervisor.request_restart()
             elif topic == self._topic("cmd/timelapse/stop"):
-                self._streamer.disable_timelapse()
+                restart_required = self._streamer.disable_timelapse()
+                if restart_required and self._streamer.settings.mode == "mediamtx_rtsp" and self._supervisor.desired_running:
+                    self._supervisor.request_restart()
             elif topic == self._topic("cmd/timelapse/set"):
                 payload = json.loads(payload_text)
                 if not isinstance(payload, dict):
@@ -975,7 +929,10 @@ class MqttController:
                 LOG.warning("ignoring unknown topic: %s", topic)
         except Exception as exc:
             LOG.exception("mqtt command failed")
-            self._streamer._set_stream_state("error", str(exc))
+            if is_timelapse_command:
+                self._streamer._set_timelapse_state("error", str(exc))
+            else:
+                self._streamer._set_stream_state("error", str(exc))
         finally:
             self._publish_status()
 
