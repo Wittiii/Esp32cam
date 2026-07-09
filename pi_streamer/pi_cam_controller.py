@@ -372,19 +372,24 @@ class CameraStreamer:
                 latest_file = str(file_path)
         return total, latest_file
 
-    def _refresh_timelapse_storage(self, force: bool = False) -> None:
+    def _refresh_timelapse_storage(self, force: bool = False) -> bool:
         timelapse = self.timelapse_settings
         interval = max(1, timelapse.storage_check_seconds)
         now = time.monotonic()
         if not force and now - self._last_storage_refresh < interval:
-            return
+            return False
 
         total, latest_file = self._calculate_storage_usage(self.timelapse_output_dir())
+        changed = False
         with self._lock:
+            changed = (
+                self._timelapse_storage_bytes != total
+                or self._timelapse_last_image != latest_file
+            )
             self._timelapse_storage_bytes = total
             self._timelapse_last_image = latest_file
             self._last_storage_refresh = now
-        self._notify_status()
+        return changed
 
     def _timelapse_capacity_reached(self) -> bool:
         self._refresh_timelapse_storage(force=True)
@@ -469,7 +474,9 @@ class CameraStreamer:
             self._stop_timelapse_process(set_state="error", error=str(exc))
             return
 
-        self._refresh_timelapse_storage()
+        refreshed = self._refresh_timelapse_storage()
+        if refreshed:
+            self._notify_status()
         if self._timelapse_capacity_reached():
             LOG.warning("timelapse storage limit reached, stopping timelapse capture")
             self.update_timelapse_settings(enabled=False)
