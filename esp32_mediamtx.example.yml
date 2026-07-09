@@ -1,0 +1,3 @@
+paths:
+  esp32-cam-01:
+    source: rtsp://esp32-cam-streamer.local:8554/mjpeg/1

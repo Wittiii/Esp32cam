@@ -1,0 +1,38 @@
+{
+  "stream": {
+    "host": "192.168.178.27",
+    "port": 8554,
+    "width": 1280,
+    "height": 720,
+    "framerate": 20,
+    "bitrate": 2500000,
+    "sharpness": 1.0,
+    "brightness": 0.0,
+    "contrast": 1.0,
+    "saturation": 1.0,
+    "mode": "mediamtx_rtsp",
+    "path": "pi-zero-01",
+    "transport": "tcp",
+    "codec": "h264",
+    "inline_headers": true,
+    "nopreview": true,
+    "ffmpeg_path": "ffmpeg"
+  },
+  "timelapse": {
+    "enabled": true,
+    "interval_seconds": 60,
+    "output_dir": "timelapse",
+    "max_storage_gb": 22.0,
+    "jpeg_quality": 2,
+    "storage_check_seconds": 15
+  },
+  "mqtt": {
+    "host": "192.168.178.27",
+    "port": 1883,
+    "username": "",
+    "password": "",
+    "client_id": "pi-zero-01",
+    "base_topic": "camera/pi-zero-01",
+    "keepalive": 60
+  }
+}
