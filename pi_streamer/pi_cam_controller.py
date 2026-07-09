@@ -362,8 +362,6 @@ class CameraStreamer:
             "warning",
             "-rtsp_transport",
             stream.transport,
-            "-rw_timeout",
-            "10000000",
             "-i",
             stream.target_url(),
             "-frames:v",
@@ -541,7 +539,7 @@ class CameraStreamer:
 
     def _run_timelapse_snapshot_loop(self) -> None:
         interval_seconds = max(1, self.timelapse_settings.interval_seconds)
-        next_capture_at = time.monotonic()
+        next_capture_at = time.monotonic() + min(5, interval_seconds)
 
         try:
             while not self._is_stopping() and not self._timelapse_stop_requested.is_set():
