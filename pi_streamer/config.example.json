@@ -1,6 +1,6 @@
 {
   "stream": {
-    "host": "192.168.178.27",
+    "host": "192.168.178.56",
     "port": 8554,
     "width": 1280,
     "height": 720,
@@ -27,10 +27,10 @@
     "storage_check_seconds": 15
   },
   "mqtt": {
-    "host": "192.168.178.27",
+    "host": "192.168.178.56",
     "port": 1883,
-    "username": "",
-    "password": "",
+    "username": "pwi",
+    "password": "1234",
     "client_id": "pi-zero-01",
     "base_topic": "camera/pi-zero-01",
     "keepalive": 60
