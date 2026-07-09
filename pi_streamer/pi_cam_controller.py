@@ -82,7 +82,6 @@ class CameraStreamer:
         self._timelapse_process: subprocess.Popen[bytes] | None = None
         self._socket: socket.socket | None = None
         self._stdout_thread: threading.Thread | None = None
-        self._stderr_threads: list[threading.Thread] = []
         self._stop_requested = threading.Event()
         self._lock = threading.RLock()
         self._status_listener: StatusListener | None = None
@@ -414,10 +413,12 @@ class CameraStreamer:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-        self._stderr_threads.append(
-            threading.Thread(target=self._pump_stderr, args=(self._timelapse_process, "timelapse"), daemon=True)
+        timelapse_stderr_thread = threading.Thread(
+            target=self._pump_stderr,
+            args=(self._timelapse_process, "timelapse"),
+            daemon=True,
         )
-        self._stderr_threads[-1].start()
+        timelapse_stderr_thread.start()
         self._set_timelapse_state("running")
 
     def _stop_timelapse_process(self, set_state: str | None = None, error: str = "") -> None:
@@ -557,9 +558,6 @@ class CameraStreamer:
                         stderr=subprocess.PIPE,
                         bufsize=0,
                     )
-                    self._stderr_threads.append(
-                        threading.Thread(target=self._pump_stderr, args=(self._publish_process, "ffmpeg"), daemon=True)
-                    )
                 else:
                     raise RuntimeError(f"unsupported stream mode: {self.settings.mode}")
 
@@ -576,15 +574,22 @@ class CameraStreamer:
 
             self._ensure_timelapse_process()
 
-            self._stdout_thread = threading.Thread(target=self._pump_stdout, daemon=True)
-            self._stderr_threads.append(
+            stdout_thread = threading.Thread(target=self._pump_stdout, daemon=True)
+            stderr_threads: list[threading.Thread] = []
+
+            if self._publish_process is not None:
+                stderr_threads.append(
+                    threading.Thread(target=self._pump_stderr, args=(self._publish_process, "ffmpeg"), daemon=True)
+                )
+
+            stderr_threads.append(
                 threading.Thread(target=self._pump_stderr, args=(self._capture_process, "rpicam"), daemon=True)
             )
 
-            self._stdout_thread.start()
-            for thread in self._stderr_threads:
-                if not thread.is_alive():
-                    thread.start()
+            self._stdout_thread = stdout_thread
+            stdout_thread.start()
+            for thread in stderr_threads:
+                thread.start()
             self._set_stream_state("running")
 
     def _cleanup_stream_handles(self) -> None:
