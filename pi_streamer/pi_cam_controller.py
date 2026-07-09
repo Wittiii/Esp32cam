@@ -318,7 +318,10 @@ class CameraStreamer:
         output_dir = self.timelapse_output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
         pattern = str(output_dir / "frame-%Y%m%d-%H%M%S.jpg")
-        frame_interval = max(1, int(round(stream.framerate * max(1, timelapse.interval_seconds))))
+        # rpicam-vid is configured to emit one keyframe per second via --intra=<framerate>.
+        # Decode only keyframes so the Pi Zero doesn't have to fully decode every frame just
+        # to create a once-per-minute snapshot.
+        frame_interval = max(1, timelapse.interval_seconds)
 
         return [
             stream.ffmpeg_path,
@@ -334,6 +337,8 @@ class CameraStreamer:
             str(stream.framerate),
             "-f",
             "h264",
+            "-skip_frame",
+            "nokey",
             "-i",
             "pipe:0",
             "-vf",
