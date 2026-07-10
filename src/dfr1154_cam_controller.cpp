@@ -261,6 +261,7 @@ void rebuildStreamer() {
   esp_camera_fb_return(probe);
 
   g_streamer.reset(new Esp32RtspStreamer(width, height, observeJpegFrame));
+  g_streamer->setNonBlockingTcpWrites(true);
   const String hostPort = WiFi.localIP().toString() + ":" + String(dfrcfg::kRtspPort);
   g_streamer->setURI(hostPort, dfrcfg::kRtspPresentation, dfrcfg::kRtspStream);
   statusf("rtsp ready url=%s", rtspUrl().c_str());
@@ -910,7 +911,6 @@ void setupController() {
   initCamera();
   configureLightSensor();
   dfrtimelapse::begin();
-  dfrtimelapse::setServiceHook(handleRtspLoop);
 
   statusf(
       "flash=%luMB psram=%luMB heap=%luKB",

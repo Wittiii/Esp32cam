@@ -5,7 +5,9 @@
 #include <SD.h>
 #include <SPI.h>
 #include <WebServer.h>
+#include <errno.h>
 #include <esp_camera.h>
+#include <sys/socket.h>
 #include <time.h>
 
 #include "dfr1154_config.h"
@@ -30,16 +32,11 @@ uint32_t g_lastCaptureAtMs = 0;
 String g_state = "initializing";
 String g_error;
 String g_lastImage;
-dfrtimelapse::ServiceHook g_serviceHook = nullptr;
 
 constexpr uint32_t kDefaultListLimit = 50;
 constexpr uint32_t kMaximumListLimit = 100;
-constexpr size_t kHttpFileChunkBytes = 1024;
-
-void serviceBackgroundTasks() {
-  if (g_serviceHook != nullptr) g_serviceHook();
-  yield();
-}
+constexpr size_t kArchiveChunkBytes = 4096;
+constexpr uint32_t kArchiveWriteTimeoutMs = 3000;
 
 uint32_t boundedQueryNumber(const char *name, uint32_t fallback, uint32_t maximum) {
   if (!g_archiveServer.hasArg(name)) return fallback;
@@ -199,7 +196,6 @@ void handleList() {
       }
     }
     file.close();
-    serviceBackgroundTasks();
     if (hasMore) break;
     file = directory.openNextFile();
   }
@@ -241,29 +237,44 @@ void handleFile() {
   g_archiveServer.send(200, "image/jpeg", "");
 
   WiFiClient client = g_archiveServer.client();
-  uint8_t buffer[kHttpFileChunkBytes];
-  size_t sent = 0;
-  while (client.connected() && file.available()) {
+  uint8_t buffer[kArchiveChunkBytes];
+  size_t totalSent = 0;
+  bool transferFailed = false;
+  uint32_t lastProgressAt = millis();
+
+  while (client.connected() && file.available() && !transferFailed) {
     const size_t bytesRead = file.read(buffer, sizeof(buffer));
     if (bytesRead == 0) break;
 
-    size_t chunkOffset = 0;
-    while (client.connected() && chunkOffset < bytesRead) {
-      const size_t written = client.write(buffer + chunkOffset, bytesRead - chunkOffset);
-      if (written == 0) break;
-      chunkOffset += written;
-      sent += written;
-      serviceBackgroundTasks();
+    size_t offset = 0;
+    while (offset < bytesRead && client.connected()) {
+      const ssize_t sent = ::send(client.fd(), buffer + offset, bytesRead - offset, MSG_DONTWAIT);
+      if (sent > 0) {
+        offset += static_cast<size_t>(sent);
+        totalSent += static_cast<size_t>(sent);
+        lastProgressAt = millis();
+        continue;
+      }
+
+      if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        transferFailed = true;
+        break;
+      }
+      if (millis() - lastProgressAt >= kArchiveWriteTimeoutMs) {
+        transferFailed = true;
+        break;
+      }
+      delay(1);
     }
-    if (chunkOffset < bytesRead) break;
   }
   file.close();
-  if (sent != fileSize) {
+  if (transferFailed || totalSent != fileSize) {
     Serial.printf(
-        "[HTTP] incomplete archive transfer name=%s sent=%u expected=%u\n",
+        "[HTTP] archive transfer aborted name=%s sent=%u expected=%u\n",
         name.c_str(),
-        static_cast<unsigned>(sent),
+        static_cast<unsigned>(totalSent),
         static_cast<unsigned>(fileSize));
+    client.stop();
   }
 }
 
@@ -393,10 +404,6 @@ bool captureDue(uint32_t now) {
 }  // namespace
 
 namespace dfrtimelapse {
-
-void setServiceHook(ServiceHook hook) {
-  g_serviceHook = hook;
-}
 
 bool begin() {
   g_preferences.begin("dfrtime", false);

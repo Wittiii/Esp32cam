@@ -29,6 +29,7 @@ public:
     bool InitUdpTransport(void);
     void ReleaseUdpTransport(void);
     bool debug;
+    void setNonBlockingTcpWrites(bool enabled) { m_nonBlockingTcpWrites = enabled; }
     void setURI( String hostport, String pres = "mjpeg", String stream = "1" ); // set URI parts for sessions to use.
     String getURIHost(){ return m_URIHost; }; // for getting things back by sessions
     String getURIPresentation(){ return m_URIPresentation; };
@@ -59,6 +60,7 @@ private:
     uint32_t m_prevMsec;
 
     int m_udpRefCount;
+    bool m_nonBlockingTcpWrites;
 
     u_short m_width; // image data info
     u_short m_height;

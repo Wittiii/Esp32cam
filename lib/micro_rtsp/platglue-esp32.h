@@ -64,6 +64,24 @@ inline ssize_t socketsend(SOCKET sockfd, const void *buf, size_t len)
     return sockfd->write((uint8_t *) buf, len);
 }
 
+// Keep a slow RTP reader from blocking every service in the camera loop.
+// Partial TCP writes would corrupt an interleaved RTP packet, therefore the
+// session is closed and allowed to reconnect instead.
+inline ssize_t sockettrysend(SOCKET sockfd, const void *buf, size_t len)
+{
+    if (!sockfd || !sockfd->connected() || sockfd->fd() < 0) return -1;
+
+    const uint32_t startedAt = millis();
+    while (millis() - startedAt < 20) {
+        const ssize_t sent = ::send(sockfd->fd(), buf, len, MSG_DONTWAIT);
+        if (sent == static_cast<ssize_t>(len)) return sent;
+        if (sent > 0 || (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) break;
+        delay(0);
+    }
+    sockfd->stop();
+    return -1;
+}
+
 inline ssize_t udpsocketsend(UDPSOCKET sockfd, const void *buf, size_t len,
                              IPADDRESS destaddr, IPPORT destport)
 {

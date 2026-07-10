@@ -21,6 +21,7 @@ CStreamer::CStreamer(u_short width, u_short height) : m_Clients()
     m_prevMsec = 0;
 
     m_udpRefCount = 0;
+    m_nonBlockingTcpWrites = false;
 
     debug = false;
 
@@ -102,7 +103,7 @@ int CStreamer::SendRtpPacket(unsigned const char * jpeg, int jpegLen, int fragme
 
     bool isLastFragment = (fragmentOffset + fragmentLen) == jpegLen;
 
-    if (!m_Clients.NotEmpty())
+    if (streamingSessionCount() == 0)
     {
         return isLastFragment ? 0 : fragmentOffset;
     }
@@ -187,7 +188,13 @@ int CStreamer::SendRtpPacket(unsigned const char * jpeg, int jpegLen, int fragme
         session = static_cast<CRtspSession*>(element);
         if (session->m_streaming && !session->m_stopped) {
             if (session->isTcpTransport()) // RTP over RTSP - we send the buffer + 4 byte additional header
-                socketsend(session->getClient(),RtpBuf,RtpPacketSize + 4);
+            {
+                const int packetLength = RtpPacketSize + 4;
+                const ssize_t sent = m_nonBlockingTcpWrites
+                    ? sockettrysend(session->getClient(), RtpBuf, packetLength)
+                    : socketsend(session->getClient(), RtpBuf, packetLength);
+                if (sent != packetLength) session->m_stopped = true;
+            }
             else                // UDP - we send just the buffer by skipping the 4 byte RTP over RTSP header
             {
                 socketpeeraddr(session->getClient(), &otherip, &otherport);
