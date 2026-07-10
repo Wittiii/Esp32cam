@@ -70,8 +70,6 @@ uint32_t g_lastLightReadMs = 0;
 uint32_t g_framesSent = 0;
 float g_lastMeasuredFps = 0.0f;
 
-constexpr int kMaximumStableFrameSizeIndex = 2;  // SVGA (800x600)
-
 int clampValue(int value, int minimum, int maximum) {
   return value < minimum ? minimum : (value > maximum ? maximum : value);
 }
@@ -357,13 +355,7 @@ void saveControllerSettings() {
 }
 
 void loadControllerSettings() {
-  const int storedFrameSize = g_preferences.getInt("framesize", 2);
-  const int stableFrameSize = clampValue(storedFrameSize, 0, kMaximumStableFrameSizeIndex);
-  g_frameSize = frameSizeFromIndex(stableFrameSize);
-  if (stableFrameSize != storedFrameSize) {
-    g_preferences.putInt("framesize", stableFrameSize);
-    recordStatus("framesize reduced to SVGA for stable RTSP streaming");
-  }
+  g_frameSize = frameSizeFromIndex(clampValue(g_preferences.getInt("framesize", 2), 0, 7));
   g_jpegQuality = clampValue(g_preferences.getInt("quality", 10), 4, 63);
   g_streamFps = clampValue(g_preferences.getInt("fps", dfrcfg::kDefaultRtspFps), 1, 20);
   g_brightness = clampValue(g_preferences.getInt("bright", 1), -2, 2);
@@ -621,8 +613,7 @@ bool extractPayloadInt(const String &payload, const char *key, int &value) {
 
 bool applySetting(const char *key, int value, bool &streamRebuildRequired, bool &cameraRestartRequired) {
   if (strcmp(key, "framesize") == 0) {
-    const framesize_t bounded =
-        frameSizeFromIndex(clampValue(value, 0, kMaximumStableFrameSizeIndex));
+    const framesize_t bounded = frameSizeFromIndex(clampValue(value, 0, 7));
     if (bounded == g_frameSize) return false;
     g_frameSize = bounded;
     cameraRestartRequired = true;
