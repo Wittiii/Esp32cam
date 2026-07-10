@@ -70,6 +70,8 @@ uint32_t g_lastLightReadMs = 0;
 uint32_t g_framesSent = 0;
 float g_lastMeasuredFps = 0.0f;
 
+constexpr int kMaximumStableFrameSizeIndex = 2;  // SVGA (800x600)
+
 int clampValue(int value, int minimum, int maximum) {
   return value < minimum ? minimum : (value > maximum ? maximum : value);
 }
@@ -146,11 +148,6 @@ String rtspUrl() {
   if (WiFi.status() != WL_CONNECTED) return "";
   return "rtsp://" + WiFi.localIP().toString() + ":" + String(dfrcfg::kRtspPort) + "/" +
          dfrcfg::kRtspPresentation + "/" + dfrcfg::kRtspStream;
-}
-
-String archiveUrl() {
-  if (WiFi.status() != WL_CONNECTED) return "";
-  return "http://" + WiFi.localIP().toString() + ":" + String(dfrcfg::kArchivePort);
 }
 
 String streamState() {
@@ -238,15 +235,6 @@ void handleLightSensor() {
   readAmbientLuxNow();
 }
 
-void observeJpegFrame(
-    const uint8_t *data,
-    size_t length,
-    uint16_t width,
-    uint16_t height,
-    uint32_t capturedAtMs) {
-  dfrtimelapse::observeJpegFrame(data, length, width, height, capturedAtMs);
-}
-
 void rebuildStreamer() {
   g_streamer.reset();
   if (!g_cameraReady || !g_streamEnabled || WiFi.status() != WL_CONNECTED) return;
@@ -260,8 +248,7 @@ void rebuildStreamer() {
   const uint16_t height = probe->height;
   esp_camera_fb_return(probe);
 
-  g_streamer.reset(new Esp32RtspStreamer(width, height, observeJpegFrame));
-  g_streamer->setNonBlockingTcpWrites(true);
+  g_streamer.reset(new Esp32RtspStreamer(width, height));
   const String hostPort = WiFi.localIP().toString() + ":" + String(dfrcfg::kRtspPort);
   g_streamer->setURI(hostPort, dfrcfg::kRtspPresentation, dfrcfg::kRtspStream);
   statusf("rtsp ready url=%s", rtspUrl().c_str());
@@ -321,7 +308,7 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/error", g_lastError);
   publishSimple("status/ip", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "-");
   publishSimple("status/rtsp_url", rtspUrl());
-  publishSimple("status/archive_url", archiveUrl());
+  publishSimple("status/archive_url", "");
   publishSimple("status/mdns", String(dfrcfg::kMdnsHostname) + ".local");
   publishSimple("status/last_status", g_lastStatus);
   publishSimple("status/clients", String(directStreamingSessionCount()));
@@ -332,7 +319,7 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/ir_mode", irModeName());
   publishSimple("status/ir_enabled", g_irEnabled ? "true" : "false");
   publishSimple("status/light_sensor", g_lightReady ? "ready" : "unavailable");
-  publishSimple("status/sd", dfrtimelapse::sdReady() ? "ready" : "unavailable");
+  publishSimple("status/sd", "not_used");
 
   publishSimple("status/timelapse/state", dfrtimelapse::state());
   publishSimple("status/timelapse/error", dfrtimelapse::error());
@@ -341,7 +328,7 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/timelapse/card_total_bytes", uint64String(dfrtimelapse::cardTotalBytes()));
   publishSimple("status/timelapse/card_used_bytes", uint64String(dfrtimelapse::cardUsedBytes()));
   publishSimple("status/timelapse/last_image", dfrtimelapse::lastImage());
-  publishSimple("status/timelapse/output_dir", dfrcfg::kTimelapseDirectory);
+  publishSimple("status/timelapse/output_dir", "server");
   publishSimple("status/timelapse/enabled", dfrtimelapse::enabled() ? "true" : "false");
   publishSimple("status/timelapse/interval_seconds", String(dfrtimelapse::intervalSeconds()));
 
@@ -370,7 +357,13 @@ void saveControllerSettings() {
 }
 
 void loadControllerSettings() {
-  g_frameSize = frameSizeFromIndex(g_preferences.getInt("framesize", 2));
+  const int storedFrameSize = g_preferences.getInt("framesize", 2);
+  const int stableFrameSize = clampValue(storedFrameSize, 0, kMaximumStableFrameSizeIndex);
+  g_frameSize = frameSizeFromIndex(stableFrameSize);
+  if (stableFrameSize != storedFrameSize) {
+    g_preferences.putInt("framesize", stableFrameSize);
+    recordStatus("framesize reduced to SVGA for stable RTSP streaming");
+  }
   g_jpegQuality = clampValue(g_preferences.getInt("quality", 10), 4, 63);
   g_streamFps = clampValue(g_preferences.getInt("fps", dfrcfg::kDefaultRtspFps), 1, 20);
   g_brightness = clampValue(g_preferences.getInt("bright", 1), -2, 2);
@@ -537,7 +530,6 @@ void configureMdns() {
     return;
   }
   MDNS.addService("rtsp", "tcp", dfrcfg::kRtspPort);
-  MDNS.addService("http", "tcp", dfrcfg::kArchivePort);
   g_mdnsReady = true;
 }
 
@@ -568,7 +560,6 @@ void handleNetworkServices() {
   g_networkServicesPending = false;
   configureMdns();
   ensureRtspServer();
-  dfrtimelapse::startHttpServer();
   rebuildStreamer();
 }
 
@@ -630,7 +621,8 @@ bool extractPayloadInt(const String &payload, const char *key, int &value) {
 
 bool applySetting(const char *key, int value, bool &streamRebuildRequired, bool &cameraRestartRequired) {
   if (strcmp(key, "framesize") == 0) {
-    const framesize_t bounded = frameSizeFromIndex(clampValue(value, 0, 7));
+    const framesize_t bounded =
+        frameSizeFromIndex(clampValue(value, 0, kMaximumStableFrameSizeIndex));
     if (bounded == g_frameSize) return false;
     g_frameSize = bounded;
     cameraRestartRequired = true;
@@ -933,10 +925,8 @@ void loopController() {
   handleNetworkServices();
   configureMdns();
   ensureMqtt();
-  dfrtimelapse::handleHttpClient();
   handleLightSensor();
   handleRtspLoop();
-  dfrtimelapse::captureIfDue();
   updateRuntimeStats();
   delay(1);
 }
