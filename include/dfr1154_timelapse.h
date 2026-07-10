@@ -4,7 +4,10 @@
 
 namespace dfrtimelapse {
 
+using ServiceHook = void (*)();
+
 bool begin();
+void setServiceHook(ServiceHook hook);
 void startHttpServer();
 void handleHttpClient();
 void captureIfDue();

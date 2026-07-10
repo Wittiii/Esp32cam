@@ -910,6 +910,7 @@ void setupController() {
   initCamera();
   configureLightSensor();
   dfrtimelapse::begin();
+  dfrtimelapse::setServiceHook(handleRtspLoop);
 
   statusf(
       "flash=%luMB psram=%luMB heap=%luKB",

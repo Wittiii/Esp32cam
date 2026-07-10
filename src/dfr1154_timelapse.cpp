@@ -30,6 +30,23 @@ uint32_t g_lastCaptureAtMs = 0;
 String g_state = "initializing";
 String g_error;
 String g_lastImage;
+dfrtimelapse::ServiceHook g_serviceHook = nullptr;
+
+constexpr uint32_t kDefaultListLimit = 50;
+constexpr uint32_t kMaximumListLimit = 100;
+constexpr size_t kHttpFileChunkBytes = 1024;
+
+void serviceBackgroundTasks() {
+  if (g_serviceHook != nullptr) g_serviceHook();
+  yield();
+}
+
+uint32_t boundedQueryNumber(const char *name, uint32_t fallback, uint32_t maximum) {
+  if (!g_archiveServer.hasArg(name)) return fallback;
+  const long parsed = g_archiveServer.arg(name).toInt();
+  if (parsed <= 0) return fallback;
+  return min(static_cast<uint32_t>(parsed), maximum);
+}
 
 String uint64String(uint64_t value) {
   char buffer[24];
@@ -146,35 +163,54 @@ void handleList() {
     return;
   }
 
+  const uint32_t offset = g_archiveServer.hasArg("offset")
+      ? max(0L, g_archiveServer.arg("offset").toInt())
+      : 0;
+  const uint32_t limit = boundedQueryNumber("limit", kDefaultListLimit, kMaximumListLimit);
+
   g_archiveServer.sendHeader("Cache-Control", "no-store");
   g_archiveServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   g_archiveServer.send(200, "application/json", "");
   g_archiveServer.sendContent("{\"ok\":true,\"files\":[");
 
   bool first = true;
-  uint32_t count = 0;
+  uint32_t matched = 0;
+  uint32_t returned = 0;
+  bool hasMore = false;
   File directory = SD.open(dfrcfg::kTimelapseDirectory);
   File file = directory.openNextFile();
   while (file) {
     if (!file.isDirectory() && hasJpegExtension(file.name())) {
       const String name = baseName(file.name());
       if (validImageName(name)) {
-        if (!first) g_archiveServer.sendContent(",");
-        first = false;
-        String item = "{\"name\":\"" + name + "\",\"sizeBytes\":";
-        item += String(static_cast<uint32_t>(file.size()));
-        item += ",\"modifiedEpoch\":" + String(static_cast<uint32_t>(file.getLastWrite()));
-        item += "}";
-        g_archiveServer.sendContent(item);
-        ++count;
+        if (matched >= offset && returned < limit) {
+          if (!first) g_archiveServer.sendContent(",");
+          first = false;
+          String item = "{\"name\":\"" + name + "\",\"sizeBytes\":";
+          item += String(static_cast<uint32_t>(file.size()));
+          item += ",\"modifiedEpoch\":" + String(static_cast<uint32_t>(file.getLastWrite()));
+          item += "}";
+          g_archiveServer.sendContent(item);
+          ++returned;
+        } else if (matched >= offset + returned && returned >= limit) {
+          hasMore = true;
+        }
+        ++matched;
       }
     }
     file.close();
+    serviceBackgroundTasks();
+    if (hasMore) break;
     file = directory.openNextFile();
   }
   directory.close();
 
-  String tail = "],\"count\":" + String(count);
+  String tail = "],\"count\":" + String(returned);
+  tail += ",\"offset\":" + String(offset);
+  tail += ",\"limit\":" + String(limit);
+  tail += ",\"nextOffset\":" + String(offset + returned);
+  tail += ",\"hasMore\":";
+  tail += hasMore ? "true" : "false";
   tail += ",\"storageBytes\":" + uint64String(g_storageBytes) + "}";
   g_archiveServer.sendContent(tail);
   g_archiveServer.sendContent("");
@@ -199,9 +235,36 @@ void handleFile() {
     return;
   }
 
+  const size_t fileSize = file.size();
   g_archiveServer.sendHeader("Cache-Control", "private, max-age=3600");
-  g_archiveServer.streamFile(file, "image/jpeg");
+  g_archiveServer.setContentLength(fileSize);
+  g_archiveServer.send(200, "image/jpeg", "");
+
+  WiFiClient client = g_archiveServer.client();
+  uint8_t buffer[kHttpFileChunkBytes];
+  size_t sent = 0;
+  while (client.connected() && file.available()) {
+    const size_t bytesRead = file.read(buffer, sizeof(buffer));
+    if (bytesRead == 0) break;
+
+    size_t chunkOffset = 0;
+    while (client.connected() && chunkOffset < bytesRead) {
+      const size_t written = client.write(buffer + chunkOffset, bytesRead - chunkOffset);
+      if (written == 0) break;
+      chunkOffset += written;
+      sent += written;
+      serviceBackgroundTasks();
+    }
+    if (chunkOffset < bytesRead) break;
+  }
   file.close();
+  if (sent != fileSize) {
+    Serial.printf(
+        "[HTTP] incomplete archive transfer name=%s sent=%u expected=%u\n",
+        name.c_str(),
+        static_cast<unsigned>(sent),
+        static_cast<unsigned>(fileSize));
+  }
 }
 
 bool deleteImage(const String &name) {
@@ -330,6 +393,10 @@ bool captureDue(uint32_t now) {
 }  // namespace
 
 namespace dfrtimelapse {
+
+void setServiceHook(ServiceHook hook) {
+  g_serviceHook = hook;
+}
 
 bool begin() {
   g_preferences.begin("dfrtime", false);
