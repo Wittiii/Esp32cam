@@ -161,6 +161,7 @@ String streamState() {
 }
 
 void publishStatus(bool forceConfig = false);
+void configureLightSensor();
 
 void recordStatus(const String &message) {
   g_lastStatus = message;
@@ -219,16 +220,22 @@ void evaluateIrAutomation() {
   }
 }
 
+bool readAmbientLuxNow() {
+  if (!g_lightReady) return false;
+  const uint32_t raw = g_lightSensor.getData();
+  const double lux = g_lightSensor.getLux(raw);
+  if (!isfinite(lux) || lux < 0.0) return false;
+  g_ambientLux = static_cast<float>(lux);
+  evaluateIrAutomation();
+  return true;
+}
+
 void handleLightSensor() {
   if (!g_lightReady) return;
   const uint32_t now = millis();
   if (now - g_lastLightReadMs < dfrcfg::kLightReadIntervalMs) return;
   g_lastLightReadMs = now;
-
-  const uint32_t raw = g_lightSensor.getData();
-  const double lux = g_lightSensor.getLux(raw);
-  if (isfinite(lux) && lux >= 0.0) g_ambientLux = static_cast<float>(lux);
-  evaluateIrAutomation();
+  readAmbientLuxNow();
 }
 
 void observeJpegFrame(
@@ -385,14 +392,38 @@ bool applySensorSettings(bool rebuildAfter) {
     setError("camera sensor unavailable");
     return false;
   }
-  sensor->set_framesize(sensor, g_frameSize);
-  sensor->set_quality(sensor, g_jpegQuality);
-  sensor->set_brightness(sensor, g_brightness);
-  sensor->set_contrast(sensor, g_contrast);
-  sensor->set_saturation(sensor, g_saturation);
-  sensor->set_sharpness(sensor, g_sharpness);
-  sensor->set_hmirror(sensor, g_hmirror);
-  sensor->set_vflip(sensor, g_vflip);
+  if (sensor->set_framesize(sensor, g_frameSize) != 0) {
+    setError("camera framesize apply failed");
+    return false;
+  }
+  if (sensor->set_quality(sensor, g_jpegQuality) != 0) {
+    setError("camera quality apply failed");
+    return false;
+  }
+  if (sensor->set_brightness(sensor, g_brightness) != 0) {
+    setError("camera brightness apply failed");
+    return false;
+  }
+  if (sensor->set_contrast(sensor, g_contrast) != 0) {
+    setError("camera contrast apply failed");
+    return false;
+  }
+  if (sensor->set_saturation(sensor, g_saturation) != 0) {
+    setError("camera saturation apply failed");
+    return false;
+  }
+  if (sensor->set_sharpness(sensor, g_sharpness) != 0) {
+    setError("camera sharpness apply failed");
+    return false;
+  }
+  if (sensor->set_hmirror(sensor, g_hmirror) != 0) {
+    setError("camera hmirror apply failed");
+    return false;
+  }
+  if (sensor->set_vflip(sensor, g_vflip) != 0) {
+    setError("camera vflip apply failed");
+    return false;
+  }
   applyLedState(g_ledEnabled != 0);
   evaluateIrAutomation();
   if (rebuildAfter) rebuildStreamer();
@@ -446,8 +477,33 @@ bool initCamera() {
   return true;
 }
 
+void shutdownCamera() {
+  g_streamer.reset();
+  if (!g_cameraReady) return;
+  esp_camera_deinit();
+  g_cameraReady = false;
+}
+
+bool restartCameraPipeline() {
+  recordStatus("camera reconfiguring");
+  shutdownCamera();
+  delay(50);
+  if (!initCamera()) return false;
+  configureLightSensor();
+  g_lastLightReadMs = 0;
+  readAmbientLuxNow();
+  rebuildStreamer();
+  clearError();
+  return true;
+}
+
 void configureLightSensor() {
   // DFRobot requires camera initialization before starting the shared SCCB/I2C bus.
+  g_lightReady = false;
+  g_ambientLux = NAN;
+  Wire.end();
+  delay(5);
+  Wire.begin(DFR_CAM_SIOD, DFR_CAM_SIOC);
   g_lightReady = g_lightSensor.begin();
   if (!g_lightReady) {
     recordStatus("LTR-308 light sensor unavailable; IR auto mode suspended");
@@ -456,6 +512,8 @@ void configureLightSensor() {
   g_lightSensor.setMeasurementRate(
       DFRobot_LTR308::eConversion_100ms_18b,
       DFRobot_LTR308::eRate_500ms);
+  g_lastLightReadMs = 0;
+  readAmbientLuxNow();
   statusf("LTR-308 ready");
 }
 
@@ -477,7 +535,6 @@ void configureMdns() {
     recordStatus("mdns setup failed");
     return;
   }
-  MDNS.addService("arduino", "tcp", 3232);
   MDNS.addService("rtsp", "tcp", dfrcfg::kRtspPort);
   MDNS.addService("http", "tcp", dfrcfg::kArchivePort);
   g_mdnsReady = true;
@@ -570,57 +627,89 @@ bool extractPayloadInt(const String &payload, const char *key, int &value) {
   return true;
 }
 
-bool applySetting(const char *key, int value, bool &rebuildRequired) {
-  sensor_t *sensor = esp_camera_sensor_get();
+bool applySetting(const char *key, int value, bool &streamRebuildRequired, bool &cameraRestartRequired) {
   if (strcmp(key, "framesize") == 0) {
-    g_frameSize = frameSizeFromIndex(clampValue(value, 0, 7));
-    if (sensor) sensor->set_framesize(sensor, g_frameSize);
-    rebuildRequired = true;
+    const framesize_t bounded = frameSizeFromIndex(clampValue(value, 0, 7));
+    if (bounded == g_frameSize) return false;
+    g_frameSize = bounded;
+    cameraRestartRequired = true;
   } else if (strcmp(key, "jpeg_quality") == 0) {
-    g_jpegQuality = clampValue(value, 4, 63);
-    if (sensor) sensor->set_quality(sensor, g_jpegQuality);
+    const int bounded = clampValue(value, 4, 63);
+    if (bounded == g_jpegQuality) return false;
+    g_jpegQuality = bounded;
+    cameraRestartRequired = true;
   } else if (strcmp(key, "stream_fps") == 0) {
-    g_streamFps = clampValue(value, 1, 20);
+    const int bounded = clampValue(value, 1, 20);
+    if (bounded == g_streamFps) return false;
+    g_streamFps = bounded;
   } else if (strcmp(key, "brightness") == 0) {
-    g_brightness = clampValue(value, -2, 2);
-    if (sensor) sensor->set_brightness(sensor, g_brightness);
+    const int bounded = clampValue(value, -2, 2);
+    if (bounded == g_brightness) return false;
+    g_brightness = bounded;
+    cameraRestartRequired = true;
   } else if (strcmp(key, "contrast") == 0) {
-    g_contrast = clampValue(value, -2, 2);
-    if (sensor) sensor->set_contrast(sensor, g_contrast);
+    const int bounded = clampValue(value, -2, 2);
+    if (bounded == g_contrast) return false;
+    g_contrast = bounded;
+    cameraRestartRequired = true;
   } else if (strcmp(key, "saturation") == 0) {
-    g_saturation = clampValue(value, -2, 2);
-    if (sensor) sensor->set_saturation(sensor, g_saturation);
+    const int bounded = clampValue(value, -2, 2);
+    if (bounded == g_saturation) return false;
+    g_saturation = bounded;
+    cameraRestartRequired = true;
   } else if (strcmp(key, "sharpness") == 0) {
-    g_sharpness = clampValue(value, -2, 2);
-    if (sensor) sensor->set_sharpness(sensor, g_sharpness);
+    const int bounded = clampValue(value, -2, 2);
+    if (bounded == g_sharpness) return false;
+    g_sharpness = bounded;
+    cameraRestartRequired = true;
   } else if (strcmp(key, "hmirror") == 0) {
-    g_hmirror = value ? 1 : 0;
-    if (sensor) sensor->set_hmirror(sensor, g_hmirror);
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_hmirror) return false;
+    g_hmirror = bounded;
+    cameraRestartRequired = true;
   } else if (strcmp(key, "vflip") == 0) {
-    g_vflip = value ? 1 : 0;
-    if (sensor) sensor->set_vflip(sensor, g_vflip);
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_vflip) return false;
+    g_vflip = bounded;
+    cameraRestartRequired = true;
   } else if (strcmp(key, "led") == 0) {
-    applyLedState(value != 0);
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_ledEnabled) return false;
+    applyLedState(bounded != 0);
   } else if (strcmp(key, "stream_enabled") == 0) {
-    g_streamEnabled = value != 0;
-    rebuildRequired = true;
+    const bool enabled = value != 0;
+    if (enabled == g_streamEnabled) return false;
+    g_streamEnabled = enabled;
+    streamRebuildRequired = true;
   } else if (strcmp(key, "ir_mode") == 0) {
-    g_irMode = clampValue(value, 0, 2);
+    const int bounded = clampValue(value, 0, 2);
+    if (bounded == g_irMode) return false;
+    g_irMode = bounded;
     evaluateIrAutomation();
   } else if (strcmp(key, "ir_on_lux") == 0) {
-    g_irOnBelowLux = static_cast<float>(clampValue(value, 0, 100000));
+    const float bounded = static_cast<float>(clampValue(value, 0, 100000));
+    if (fabsf(bounded - g_irOnBelowLux) < 0.01f) return false;
+    g_irOnBelowLux = bounded;
     if (g_irOffAboveLux <= g_irOnBelowLux) g_irOffAboveLux = g_irOnBelowLux + 2.0f;
     evaluateIrAutomation();
   } else if (strcmp(key, "ir_off_lux") == 0) {
-    g_irOffAboveLux = static_cast<float>(clampValue(value, 1, 100000));
+    const float bounded = static_cast<float>(clampValue(value, 1, 100000));
+    if (fabsf(bounded - g_irOffAboveLux) < 0.01f) return false;
+    g_irOffAboveLux = bounded;
     if (g_irOffAboveLux <= g_irOnBelowLux) g_irOnBelowLux = max(0.0f, g_irOffAboveLux - 2.0f);
     evaluateIrAutomation();
   } else if (strcmp(key, "timelapse_enabled") == 0) {
-    dfrtimelapse::setEnabled(value != 0);
+    const bool enabled = value != 0;
+    if (enabled == dfrtimelapse::enabled()) return false;
+    dfrtimelapse::setEnabled(enabled);
   } else if (strcmp(key, "timelapse_interval_seconds") == 0) {
-    dfrtimelapse::setIntervalSeconds(static_cast<uint32_t>(max(5, value)));
+    const uint32_t bounded = static_cast<uint32_t>(max(5, value));
+    if (bounded == dfrtimelapse::intervalSeconds()) return false;
+    dfrtimelapse::setIntervalSeconds(bounded);
   } else if (strcmp(key, "timelapse_limit_gb") == 0) {
-    dfrtimelapse::setStorageLimitBytes(static_cast<uint64_t>(max(1, value)) * 1024ULL * 1024ULL * 1024ULL);
+    const uint64_t bounded = static_cast<uint64_t>(max(1, value)) * 1024ULL * 1024ULL * 1024ULL;
+    if (bounded == dfrtimelapse::storageLimitBytes()) return false;
+    dfrtimelapse::setStorageLimitBytes(bounded);
   } else {
     return false;
   }
@@ -634,10 +723,14 @@ void applyControlPayload(const String &payload) {
       "ir_off_lux", "timelapse_enabled", "timelapse_interval_seconds", "timelapse_limit_gb"};
 
   bool changed = false;
-  bool rebuildRequired = false;
+  bool streamRebuildRequired = false;
+  bool cameraRestartRequired = false;
   for (const char *key : keys) {
     int value = 0;
-    if (extractPayloadInt(payload, key, value) && applySetting(key, value, rebuildRequired)) changed = true;
+    if (extractPayloadInt(payload, key, value) &&
+        applySetting(key, value, streamRebuildRequired, cameraRestartRequired)) {
+      changed = true;
+    }
   }
 
   if (!changed) {
@@ -645,7 +738,11 @@ void applyControlPayload(const String &payload) {
     return;
   }
   saveControllerSettings();
-  if (rebuildRequired) rebuildStreamer();
+  if (cameraRestartRequired) {
+    if (!restartCameraPipeline()) return;
+  } else if (streamRebuildRequired) {
+    rebuildStreamer();
+  }
   clearError();
   publishStatus(true);
 }
