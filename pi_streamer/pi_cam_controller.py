@@ -665,6 +665,15 @@ class MqttController:
             return ""
 
     def _on_connect(self, client: mqtt.Client, userdata: Any, flags: Any, reason_code: Any, properties: Any) -> None:
+        try:
+            connection_failed = bool(reason_code.is_failure)
+        except AttributeError:
+            connection_failed = int(reason_code) != 0
+        if connection_failed:
+            self._connected = False
+            LOG.error("mqtt connection rejected: %s", reason_code)
+            return
+
         LOG.info("mqtt connected: %s", reason_code)
         self._connected = True
         for suffix in (
