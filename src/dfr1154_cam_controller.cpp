@@ -506,6 +506,8 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       statusf("wifi disconnected reason=%d", info.wifi_sta_disconnected.reason);
+      g_mqttClient.disconnect();
+      g_lastMqttAttemptMs = 0;
       g_streamer.reset();
       MDNS.end();
       g_mdnsReady = false;
@@ -723,6 +725,7 @@ void ensureMqtt() {
 
   g_mqttClient.setServer(dfrcfg::kMqttHost, dfrcfg::kMqttPort);
   g_mqttClient.setCallback(mqttCallback);
+  g_mqttClient.setSocketTimeout(1);
   g_mqttClient.setBufferSize(1024);
   const String willTopic = mqttTopic("status/online");
   bool connected = false;
@@ -845,6 +848,7 @@ void loopController() {
   handleNetworkServices();
   configureMdns();
   ensureMqtt();
+  ArduinoOTA.handle();
   handleLightSensor();
   handleRtspLoop();
   updateRuntimeStats();
