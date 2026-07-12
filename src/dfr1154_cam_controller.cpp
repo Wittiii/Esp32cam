@@ -45,7 +45,7 @@ bool g_timeConfigured = false;
 bool g_streamEnabled = true;
 bool g_networkServicesPending = false;
 
-framesize_t g_frameSize = FRAMESIZE_SVGA;
+framesize_t g_frameSize = FRAMESIZE_UXGA;
 int g_jpegQuality = 10;
 int g_brightness = 1;
 int g_contrast = 0;
@@ -310,7 +310,8 @@ void saveControllerSettings() {
 }
 
 void loadControllerSettings() {
-  g_frameSize = frameSizeFromIndex(clampValue(g_preferences.getInt("framesize", 2), 0, 7));
+  const bool alignDfrDefaults = g_preferences.getUChar("cfgver", 0) < 2;
+  g_frameSize = frameSizeFromIndex(clampValue(g_preferences.getInt("framesize", 6), 0, 7));
   g_jpegQuality = clampValue(g_preferences.getInt("quality", 10), 4, 63);
   g_streamFps = clampValue(g_preferences.getInt("fps", dfrcfg::kDefaultRtspFps), 1, 20);
   g_brightness = clampValue(g_preferences.getInt("bright", 1), -2, 2);
@@ -325,6 +326,19 @@ void loadControllerSettings() {
   g_irOnBelowLux = g_preferences.getFloat("ironlux", dfrcfg::kDefaultIrOnBelowLux);
   g_irOffAboveLux = g_preferences.getFloat("irofflux", dfrcfg::kDefaultIrOffAboveLux);
   if (g_irOffAboveLux <= g_irOnBelowLux) g_irOffAboveLux = g_irOnBelowLux + 2.0f;
+
+  // Match DFRobot's CameraWebServer defaults once; later user changes remain persistent.
+  if (alignDfrDefaults) {
+    g_frameSize = FRAMESIZE_UXGA;
+    g_jpegQuality = 10;
+    g_brightness = 1;
+    g_contrast = 0;
+    g_saturation = -2;
+    g_sharpness = 0;
+    g_vflip = 1;
+    saveControllerSettings();
+    g_preferences.putUChar("cfgver", 2);
+  }
 }
 
 bool applySensorSettings(bool rebuildAfter) {
