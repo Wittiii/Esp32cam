@@ -5,8 +5,8 @@ This folder contains a Raspberry Pi camera sender that:
 - captures H.264 with `rpicam-vid`
 - publishes the live stream to MediaMTX or a raw TCP receiver
 - keeps retrying the stream after reconnects or target outages
-- optionally writes a timelapse from the same live video stream
-- reports stream and timelapse state back through MQTT
+- delegates timelapse capture to the central server without writing to the Pi SD card
+- reports detailed stream health and server-capture settings through MQTT
 
 ## Supported output modes
 
@@ -24,7 +24,7 @@ chmod +x pi_streamer/install_pi_streamer.sh
 ./pi_streamer/install_pi_streamer.sh
 ```
 
-The install script creates a virtual environment and installs `ffmpeg`, which is required for `mediamtx_rtsp` and the timelapse writer.
+The install script creates a virtual environment and installs `ffmpeg`, which is required for `mediamtx_rtsp`.
 
 ## Configure
 
@@ -52,15 +52,10 @@ pi_streamer/config.json
   - starts the timelapse worker automatically
 - `timelapse.interval_seconds`
   - one image every N seconds
-- `timelapse.output_dir`
-  - directory for JPEG images
 - `timelapse.max_storage_gb`
-  - timelapse stops automatically when this limit is reached
-- `timelapse.jpeg_quality`
-  - FFmpeg MJPEG quality scale from `2` to `31`
-  - lower is better, `2` is high quality
-- `timelapse.storage_check_seconds`
-  - how often storage usage is recalculated
+  - per-camera limit enforced by the server
+
+The legacy fields `output_dir`, `jpeg_quality` and `storage_check_seconds` remain accepted for config compatibility, but the Pi no longer writes images locally.
 
 ### MQTT fields
 
@@ -122,7 +117,7 @@ camera/pi-zero-01
 {
   "interval_seconds": 60,
   "max_storage_gb": 22.0,
-  "output_dir": "timelapse"
+  "max_storage_gb": 22.0
 }
 ```
 
@@ -145,11 +140,10 @@ camera/pi-zero-01
 
 ## Timelapse behavior
 
-- The timelapse is generated from the same live stream bytes that are already leaving the camera.
-- No second camera capture process is opened for snapshots.
-- When the configured storage limit is reached, the timelapse stops and reports `storage_full`.
-- The live stream itself keeps running.
-- The operator must free space and then send `cmd/timelapse/start` again.
+- The Pi only publishes H.264 to MediaMTX and never writes timelapse images to its SD card.
+- The Node.js server captures JPEGs from the MediaMTX path.
+- Per-camera limits and a global server disk reserve are enforced by the server.
+- A stream watchdog restarts capture and publishing when no video bytes flow for 15 seconds.
 
 ## systemd
 
