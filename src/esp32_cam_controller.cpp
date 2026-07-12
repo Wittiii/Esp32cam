@@ -519,21 +519,21 @@ void ensureMqtt() {
   g_mqttClient.setCallback(mqttCallback);
   g_mqttClient.setBufferSize(512);
 
-  const char *willTopic = mqttTopic("status/online").c_str();
+  const String willTopic = mqttTopic("status/online");
   bool connected = false;
   if (strlen(appcfg::kMqttUsername) > 0) {
     connected = g_mqttClient.connect(
         appcfg::kMqttClientId,
         appcfg::kMqttUsername,
         appcfg::kMqttPassword,
-        willTopic,
+        willTopic.c_str(),
         1,
         true,
         "false");
   } else {
     connected = g_mqttClient.connect(
         appcfg::kMqttClientId,
-        willTopic,
+        willTopic.c_str(),
         1,
         true,
         "false");
