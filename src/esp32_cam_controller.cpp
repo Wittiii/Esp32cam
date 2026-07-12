@@ -1,8 +1,10 @@
+
 #include "esp32_cam_controller.h"
 
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
+#include <Preferences.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
@@ -19,6 +21,7 @@
 #include "soc/soc.h"
 
 #include "app_config.h"
+#include "camera_common.h"
 #include "camera_pins.h"
 #include "esp32_rtsp_streamer.h"
 
@@ -27,6 +30,7 @@ namespace {
 WiFiServer g_rtspServer(appcfg::kRtspPort);
 WiFiClient g_mqttSocket;
 PubSubClient g_mqttClient(g_mqttSocket);
+Preferences g_preferences;
 std::unique_ptr<Esp32RtspStreamer> g_streamer;
 
 bool g_psramAvailable = false;
@@ -66,66 +70,15 @@ int directStreamingSessionCount() {
 }
 
 const char *frameSizeName() {
-  switch (g_frameSize) {
-    case FRAMESIZE_QVGA:
-      return "QVGA";
-    case FRAMESIZE_VGA:
-      return "VGA";
-    case FRAMESIZE_SVGA:
-      return "SVGA";
-    case FRAMESIZE_XGA:
-      return "XGA";
-    case FRAMESIZE_HD:
-      return "HD";
-    case FRAMESIZE_SXGA:
-      return "SXGA";
-    case FRAMESIZE_UXGA:
-      return "UXGA";
-    default:
-      return "OTHER";
-  }
+  return camcommon::frameSizeName(g_frameSize);
 }
 
 framesize_t frameSizeFromIndex(int index) {
-  switch (index) {
-    case 0:
-      return FRAMESIZE_QVGA;
-    case 1:
-      return FRAMESIZE_VGA;
-    case 2:
-      return FRAMESIZE_SVGA;
-    case 3:
-      return FRAMESIZE_XGA;
-    case 4:
-      return FRAMESIZE_HD;
-    case 5:
-      return FRAMESIZE_SXGA;
-    case 6:
-      return FRAMESIZE_UXGA;
-    default:
-      return g_frameSize;
-  }
+  return camcommon::frameSizeFromIndex(index, g_frameSize, false);
 }
 
 int frameSizeToIndex(framesize_t size) {
-  switch (size) {
-    case FRAMESIZE_QVGA:
-      return 0;
-    case FRAMESIZE_VGA:
-      return 1;
-    case FRAMESIZE_SVGA:
-      return 2;
-    case FRAMESIZE_XGA:
-      return 3;
-    case FRAMESIZE_HD:
-      return 4;
-    case FRAMESIZE_SXGA:
-      return 5;
-    case FRAMESIZE_UXGA:
-      return 6;
-    default:
-      return 1;
-  }
+  return camcommon::frameSizeToIndex(size, 1);
 }
 
 const char *flashModeName(FlashMode_t mode) {
@@ -161,13 +114,7 @@ const char *psramChipSizeName(esp_spiram_size_t size) {
 }
 
 int clampValue(int value, int minValue, int maxValue) {
-  if (value < minValue) {
-    return minValue;
-  }
-  if (value > maxValue) {
-    return maxValue;
-  }
-  return value;
+  return camcommon::clampInt(value, minValue, maxValue);
 }
 
 String mqttTopic(const char *suffix) {
@@ -178,19 +125,9 @@ String mqttTopic(const char *suffix) {
 }
 
 String rtspUrl() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return "rtsp://offline";
-  }
-
-  String url = "rtsp://";
-  url += WiFi.localIP().toString();
-  url += ":";
-  url += String(appcfg::kRtspPort);
-  url += "/";
-  url += appcfg::kRtspPresentation;
-  url += "/";
-  url += appcfg::kRtspStream;
-  return url;
+  if (WiFi.status() != WL_CONNECTED) return "";
+  return camcommon::rtspUrl(
+      WiFi.localIP(), appcfg::kRtspPort, appcfg::kRtspPresentation, appcfg::kRtspStream);
 }
 
 void publishStatus(bool forceConfig = false);
@@ -448,10 +385,42 @@ bool applySensorSettings(bool rebuildAfter) {
   return true;
 }
 
+void saveControllerSettings() {
+  g_preferences.putInt("framesize", frameSizeToIndex(g_frameSize));
+  g_preferences.putInt("quality", g_jpegQuality);
+  g_preferences.putInt("fps", g_streamFps);
+  g_preferences.putInt("bright", g_brightness);
+  g_preferences.putInt("contrast", g_contrast);
+  g_preferences.putInt("saturate", g_saturation);
+  g_preferences.putInt("sharp", g_sharpness);
+  g_preferences.putInt("hmirror", g_hmirror);
+  g_preferences.putInt("vflip", g_vflip);
+  g_preferences.putBool("led", g_ledEnabled != 0);
+  g_preferences.putBool("stream", g_streamEnabled);
+}
+
+void loadControllerSettings() {
+  g_frameSize = frameSizeFromIndex(clampValue(g_preferences.getInt("framesize", frameSizeToIndex(g_frameSize)), 0, 6));
+  g_jpegQuality = clampValue(g_preferences.getInt("quality", g_jpegQuality), 4, 63);
+  g_streamFps = clampValue(g_preferences.getInt("fps", appcfg::kDefaultRtspFps), 1, 25);
+  g_brightness = clampValue(g_preferences.getInt("bright", 1), -2, 2);
+  g_contrast = clampValue(g_preferences.getInt("contrast", 0), -2, 2);
+  g_saturation = clampValue(g_preferences.getInt("saturate", -1), -2, 2);
+  g_sharpness = clampValue(g_preferences.getInt("sharp", 0), -2, 2);
+  g_hmirror = g_preferences.getInt("hmirror", 0) ? 1 : 0;
+  g_vflip = g_preferences.getInt("vflip", 0) ? 1 : 0;
+  g_ledEnabled = g_preferences.getBool("led", false) ? 1 : 0;
+  g_streamEnabled = g_preferences.getBool("stream", true);
+}
+
 bool initCamera() {
   g_psramAvailable = psramFound();
   g_frameSize = g_psramAvailable ? FRAMESIZE_SVGA : FRAMESIZE_VGA;
   g_jpegQuality = g_psramAvailable ? 8 : 10;
+  loadControllerSettings();
+  if (!g_psramAvailable && frameSizeToIndex(g_frameSize) > 1) {
+    g_frameSize = FRAMESIZE_VGA;
+  }
 
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -608,75 +577,11 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 }
 
 bool extractPayloadToken(const String &payload, const String &key, String &token) {
-  const String jsonKey = "\"" + key + "\"";
-  int keyPos = payload.indexOf(jsonKey);
-  if (keyPos >= 0) {
-    int colonPos = payload.indexOf(':', keyPos + jsonKey.length());
-    if (colonPos < 0) {
-      return false;
-    }
-
-    int start = colonPos + 1;
-    while (start < payload.length() && isspace(payload[start])) {
-      ++start;
-    }
-    if (start >= payload.length()) {
-      return false;
-    }
-
-    if (payload[start] == '"') {
-      int end = payload.indexOf('"', start + 1);
-      if (end < 0) {
-        return false;
-      }
-      token = payload.substring(start + 1, end);
-      return true;
-    }
-
-    int end = start;
-    while (end < payload.length() && payload[end] != ',' && payload[end] != '}') {
-      ++end;
-    }
-    token = payload.substring(start, end);
-    token.trim();
-    return true;
-  }
-
-  const String kvKey = key + "=";
-  keyPos = payload.indexOf(kvKey);
-  if (keyPos < 0) {
-    return false;
-  }
-
-  int start = keyPos + kvKey.length();
-  int end = payload.indexOf(';', start);
-  if (end < 0) {
-    end = payload.length();
-  }
-  token = payload.substring(start, end);
-  token.trim();
-  return true;
+  return camcommon::extractPayloadToken(payload, key.c_str(), token);
 }
 
 bool extractPayloadInt(const String &payload, const char *key, int &value) {
-  String token;
-  if (!extractPayloadToken(payload, key, token)) {
-    return false;
-  }
-
-  token.trim();
-  token.toLowerCase();
-  if (token == "true") {
-    value = 1;
-    return true;
-  }
-  if (token == "false") {
-    value = 0;
-    return true;
-  }
-
-  value = token.toInt();
-  return true;
+  return camcommon::extractPayloadInt(payload, key, value);
 }
 
 bool applySettingByKey(const char *key, int value, bool &rebuildRequired) {
@@ -814,6 +719,7 @@ void applyControlPayload(const String &payload) {
   }
 
   if (changed) {
+    saveControllerSettings();
     clearLastError();
     statusf(
         "camera control applied frame=%s q=%d fps=%d led=%d",
@@ -838,6 +744,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
 
   if (topicText == mqttTopic("cmd/start")) {
     g_streamEnabled = true;
+    saveControllerSettings();
     rebuildStreamer();
     recordStatus("mqtt start command");
     return;
@@ -845,6 +752,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
 
   if (topicText == mqttTopic("cmd/stop")) {
     g_streamEnabled = false;
+    saveControllerSettings();
     rebuildStreamer();
     recordStatus("mqtt stop command");
     return;
@@ -946,6 +854,8 @@ void setupController() {
   Serial.setDebugOutput(false);
   Serial.println();
   Serial.println("[BOOT] ESP32-CAM RTSP controller starting");
+
+  g_preferences.begin("aicam", false);
 
   logBootDiagnostics();
 

@@ -18,10 +18,9 @@
     "nopreview": true,
     "ffmpeg_path": "ffmpeg"
   },
-  "timelapse": {
+  "server_capture": {
     "enabled": true,
-    "interval_seconds": 60,
-    "max_storage_gb": 22.0
+    "interval_seconds": 60
   },
   "mqtt": {
     "host": "192.168.178.27",

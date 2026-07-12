@@ -20,8 +20,3 @@
 
 #define DFR_LED_PIN 3
 #define DFR_IR_PIN 47
-
-#define DFR_SD_CS 10
-#define DFR_SD_MOSI 11
-#define DFR_SD_SCK 12
-#define DFR_SD_MISO 13

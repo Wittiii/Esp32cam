@@ -48,17 +48,9 @@ class StreamSettings:
 
 
 @dataclass
-class TimelapseSettings:
+class ServerCaptureSettings:
     enabled: bool = False
     interval_seconds: int = 60
-    output_dir: str = "timelapse"
-    max_storage_gb: float = 22.0
-    jpeg_quality: int = 2
-    storage_check_seconds: int = 15
-
-    @property
-    def storage_limit_bytes(self) -> int:
-        return int(self.max_storage_gb * 1024 * 1024 * 1024)
 
 
 @dataclass
@@ -73,9 +65,9 @@ class MqttSettings:
 
 
 class CameraStreamer:
-    def __init__(self, stream: StreamSettings, timelapse: TimelapseSettings, config_path: Path) -> None:
+    def __init__(self, stream: StreamSettings, server_capture: ServerCaptureSettings, config_path: Path) -> None:
         self._stream_settings = stream
-        self._timelapse_settings = timelapse
+        self._server_capture_settings = server_capture
         self._config_path = config_path
         self._capture_process: subprocess.Popen[bytes] | None = None
         self._publish_process: subprocess.Popen[bytes] | None = None
@@ -87,11 +79,16 @@ class CameraStreamer:
 
         self._stream_state = "stopped"
         self._stream_error = ""
-        self._timelapse_state = "server_capture" if timelapse.enabled else "stopped"
-        self._timelapse_error = ""
+        self._capture_request_state = "enabled" if server_capture.enabled else "disabled"
+        self._capture_request_error = ""
         self._stream_started_monotonic = 0.0
         self._last_stream_data_monotonic = 0.0
         self._stream_bytes_total = 0
+        # Normalize legacy timelapse configs immediately; storage limits belong to the server.
+        try:
+            self._write_config()
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            LOG.warning("unable to normalize config: %s", exc)
 
     @property
     def settings(self) -> StreamSettings:
@@ -99,9 +96,9 @@ class CameraStreamer:
             return self._stream_settings
 
     @property
-    def timelapse_settings(self) -> TimelapseSettings:
+    def server_capture_settings(self) -> ServerCaptureSettings:
         with self._lock:
-            return self._timelapse_settings
+            return self._server_capture_settings
 
     @property
     def state(self) -> str:
@@ -114,14 +111,14 @@ class CameraStreamer:
             return self._stream_error
 
     @property
-    def timelapse_state(self) -> str:
+    def capture_request_state(self) -> str:
         with self._lock:
-            return self._timelapse_state
+            return self._capture_request_state
 
     @property
-    def timelapse_error(self) -> str:
+    def capture_request_error(self) -> str:
         with self._lock:
-            return self._timelapse_error
+            return self._capture_request_error
 
     def set_status_listener(self, listener: StatusListener) -> None:
         with self._lock:
@@ -143,10 +140,10 @@ class CameraStreamer:
             self._stream_error = error
         self._notify_status()
 
-    def _set_timelapse_state(self, state: str, error: str = "") -> None:
+    def _set_capture_request_state(self, state: str, error: str = "") -> None:
         with self._lock:
-            self._timelapse_state = state
-            self._timelapse_error = error
+            self._capture_request_state = state
+            self._capture_request_error = error
         self._notify_status()
 
     def describe_target(self) -> str:
@@ -155,17 +152,12 @@ class CameraStreamer:
     def _is_stopping(self) -> bool:
         return self._stop_requested.is_set()
 
-    def timelapse_status(self) -> dict[str, Any]:
+    def server_capture_request(self) -> dict[str, Any]:
         return {
-            "state": self.timelapse_state,
-            "error": self.timelapse_error,
-            "storage_bytes": 0,
-            "storage_limit_bytes": self.timelapse_settings.storage_limit_bytes,
-            "last_image": "",
-            "output_dir": "server",
-            "enabled": self.timelapse_settings.enabled,
-            "interval_seconds": self.timelapse_settings.interval_seconds,
-            "capture_owner": "server",
+            "state": self.capture_request_state,
+            "error": self.capture_request_error,
+            "enabled": self.server_capture_settings.enabled,
+            "interval_seconds": self.server_capture_settings.interval_seconds,
         }
 
     def stream_health(self) -> dict[str, Any]:
@@ -202,31 +194,24 @@ class CameraStreamer:
         self._notify_status()
         return restart_required
 
-    def update_timelapse_settings(self, **changes: Any) -> bool:
-        restart_required = False
+    def update_server_capture_settings(self, **changes: Any) -> None:
         with self._lock:
-            data = asdict(self._timelapse_settings)
+            data = asdict(self._server_capture_settings)
             for name in data:
                 if name in changes:
-                    value = changes[name]
-                    if value != data[name]:
-                        data[name] = value
-                        restart_required = True
-            self._timelapse_settings = TimelapseSettings(**data)
+                    data[name] = changes[name]
+            self._server_capture_settings = ServerCaptureSettings(**data)
             self._write_config()
 
         self._notify_status()
-        return restart_required
 
-    def enable_timelapse(self) -> bool:
-        self.update_timelapse_settings(enabled=True)
-        self._set_timelapse_state("server_capture")
-        return False
+    def enable_server_capture(self) -> None:
+        self.update_server_capture_settings(enabled=True)
+        self._set_capture_request_state("enabled")
 
-    def disable_timelapse(self) -> bool:
-        self.update_timelapse_settings(enabled=False)
-        self._set_timelapse_state("stopped")
-        return False
+    def disable_server_capture(self) -> None:
+        self.update_server_capture_settings(enabled=False)
+        self._set_capture_request_state("disabled")
 
     def _write_config(self) -> None:
         current = {}
@@ -235,7 +220,8 @@ class CameraStreamer:
                 current = json.load(handle)
 
         current["stream"] = asdict(self._stream_settings)
-        current["timelapse"] = asdict(self._timelapse_settings)
+        current["server_capture"] = asdict(self._server_capture_settings)
+        current.pop("timelapse", None)
         with self._config_path.open("w", encoding="utf-8") as handle:
             json.dump(current, handle, indent=2)
 
@@ -624,12 +610,11 @@ class MqttController:
 
     def _publish_status(self) -> None:
         stream_config = asdict(self._streamer.settings)
-        timelapse = self._streamer.timelapse_status()
+        capture_request = self._streamer.server_capture_request()
         stream_config.update(
             {
-                "timelapse_enabled": timelapse["enabled"],
-                "timelapse_interval_seconds": timelapse["interval_seconds"],
-                "timelapse_limit_gb": self._streamer.timelapse_settings.max_storage_gb,
+                "server_capture_enabled": capture_request["enabled"],
+                "server_capture_interval_seconds": capture_request["interval_seconds"],
             }
         )
         health = self._streamer.stream_health()
@@ -666,15 +651,10 @@ class MqttController:
             retain=True,
         )
 
-        self._publish("status/timelapse/state", timelapse["state"], retain=True)
-        self._publish("status/timelapse/error", timelapse["error"], retain=True)
-        self._publish("status/timelapse/storage_bytes", str(timelapse["storage_bytes"]), retain=True)
-        self._publish("status/timelapse/storage_limit_bytes", str(timelapse["storage_limit_bytes"]), retain=True)
-        self._publish("status/timelapse/last_image", timelapse["last_image"], retain=True)
-        self._publish("status/timelapse/output_dir", timelapse["output_dir"], retain=True)
-        self._publish("status/timelapse/enabled", str(timelapse["enabled"]).lower(), retain=True)
-        self._publish("status/timelapse/interval_seconds", str(timelapse["interval_seconds"]), retain=True)
-        self._publish("status/timelapse/capture_owner", timelapse["capture_owner"], retain=True)
+        self._publish("status/capture_request/state", capture_request["state"], retain=True)
+        self._publish("status/capture_request/error", capture_request["error"], retain=True)
+        self._publish("status/capture_request/enabled", str(capture_request["enabled"]).lower(), retain=True)
+        self._publish("status/capture_request/interval_seconds", str(capture_request["interval_seconds"]), retain=True)
 
     def _local_ip(self) -> str:
         try:
@@ -717,9 +697,10 @@ class MqttController:
         changes = {key: value for key, value in payload.items() if key in allowed}
         timelapse_changes = {}
         aliases = {
+            "server_capture_enabled": "enabled",
+            "server_capture_interval_seconds": "interval_seconds",
             "timelapse_enabled": "enabled",
             "timelapse_interval_seconds": "interval_seconds",
-            "timelapse_limit_gb": "max_storage_gb",
         }
         for source, target in aliases.items():
             if source in payload:
@@ -731,19 +712,19 @@ class MqttController:
         if timelapse_changes:
             enabled = timelapse_changes.pop("enabled", None)
             if timelapse_changes:
-                self._streamer.update_timelapse_settings(**timelapse_changes)
+                self._streamer.update_server_capture_settings(**timelapse_changes)
             if enabled is not None:
                 if bool(enabled):
-                    self._streamer.enable_timelapse()
+                    self._streamer.enable_server_capture()
                 else:
-                    self._streamer.disable_timelapse()
+                    self._streamer.disable_server_capture()
 
     def _handle_timelapse_set(self, payload: dict[str, Any]) -> None:
-        allowed = {field.name for field in fields(TimelapseSettings)}
+        allowed = {field.name for field in fields(ServerCaptureSettings)}
         changes = {key: value for key, value in payload.items() if key in allowed and key != "enabled"}
         if not changes:
             raise ValueError("no valid timelapse settings in payload")
-        self._streamer.update_timelapse_settings(**changes)
+        self._streamer.update_server_capture_settings(**changes)
 
     def _on_message(self, client: mqtt.Client, userdata: Any, message: mqtt.MQTTMessage) -> None:
         topic = message.topic
@@ -766,9 +747,9 @@ class MqttController:
                     raise ValueError("payload must be a JSON object")
                 self._handle_stream_set(payload)
             elif topic == self._topic("cmd/timelapse/start"):
-                self._streamer.enable_timelapse()
+                self._streamer.enable_server_capture()
             elif topic == self._topic("cmd/timelapse/stop"):
-                self._streamer.disable_timelapse()
+                self._streamer.disable_server_capture()
             elif topic == self._topic("cmd/timelapse/set"):
                 payload = json.loads(payload_text)
                 if not isinstance(payload, dict):
@@ -779,7 +760,7 @@ class MqttController:
         except Exception as exc:
             LOG.exception("mqtt command failed")
             if is_timelapse_command:
-                self._streamer._set_timelapse_state("error", str(exc))
+                self._streamer._set_capture_request_state("error", str(exc))
             else:
                 self._streamer._set_stream_state("error", str(exc))
         finally:
@@ -795,14 +776,16 @@ class MqttController:
         self._client.loop_stop()
 
 
-def load_config(path: Path) -> tuple[StreamSettings, TimelapseSettings, MqttSettings]:
+def load_config(path: Path) -> tuple[StreamSettings, ServerCaptureSettings, MqttSettings]:
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
 
-    timelapse_data = data.get("timelapse", {})
+    capture_data = dict(data.get("server_capture", data.get("timelapse", {})))
+    allowed_capture_fields = {field.name for field in fields(ServerCaptureSettings)}
+    capture_data = {key: value for key, value in capture_data.items() if key in allowed_capture_fields}
     return (
         StreamSettings(**data["stream"]),
-        TimelapseSettings(**timelapse_data),
+        ServerCaptureSettings(**capture_data),
         MqttSettings(**data["mqtt"]),
     )
 
@@ -820,8 +803,8 @@ def main() -> None:
     )
 
     config_path = Path(args.config).resolve()
-    stream_settings, timelapse_settings, mqtt_settings = load_config(config_path)
-    streamer = CameraStreamer(stream_settings, timelapse_settings, config_path)
+    stream_settings, server_capture_settings, mqtt_settings = load_config(config_path)
+    streamer = CameraStreamer(stream_settings, server_capture_settings, config_path)
     supervisor = StreamSupervisor(streamer)
     controller = MqttController(mqtt_settings, streamer, supervisor)
     streamer.set_status_listener(controller.publish_streamer_status)

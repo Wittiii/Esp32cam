@@ -1,3 +1,5 @@
+
+
 #include "dfr1154_cam_controller.h"
 
 #include <Arduino.h>
@@ -18,9 +20,10 @@
 #include <string.h>
 #include <time.h>
 
+#include "camera_common.h"
 #include "dfr1154_config.h"
 #include "dfr1154_pins.h"
-#include "dfr1154_timelapse.h"
+#include "dfr1154_server_capture.h"
 #include "esp32_rtsp_streamer.h"
 
 namespace {
@@ -71,13 +74,7 @@ uint32_t g_framesSent = 0;
 float g_lastMeasuredFps = 0.0f;
 
 int clampValue(int value, int minimum, int maximum) {
-  return value < minimum ? minimum : (value > maximum ? maximum : value);
-}
-
-String uint64String(uint64_t value) {
-  char buffer[24];
-  snprintf(buffer, sizeof(buffer), "%llu", static_cast<unsigned long long>(value));
-  return String(buffer);
+  return camcommon::clampInt(value, minimum, maximum);
 }
 
 String mqttTopic(const char *suffix) {
@@ -93,45 +90,15 @@ int directStreamingSessionCount() {
 }
 
 const char *frameSizeName() {
-  switch (g_frameSize) {
-    case FRAMESIZE_QVGA: return "QVGA";
-    case FRAMESIZE_VGA: return "VGA";
-    case FRAMESIZE_SVGA: return "SVGA";
-    case FRAMESIZE_XGA: return "XGA";
-    case FRAMESIZE_HD: return "HD";
-    case FRAMESIZE_SXGA: return "SXGA";
-    case FRAMESIZE_UXGA: return "UXGA";
-    case FRAMESIZE_QXGA: return "QXGA";
-    default: return "OTHER";
-  }
+  return camcommon::frameSizeName(g_frameSize);
 }
 
 framesize_t frameSizeFromIndex(int index) {
-  switch (index) {
-    case 0: return FRAMESIZE_QVGA;
-    case 1: return FRAMESIZE_VGA;
-    case 2: return FRAMESIZE_SVGA;
-    case 3: return FRAMESIZE_XGA;
-    case 4: return FRAMESIZE_HD;
-    case 5: return FRAMESIZE_SXGA;
-    case 6: return FRAMESIZE_UXGA;
-    case 7: return FRAMESIZE_QXGA;
-    default: return g_frameSize;
-  }
+  return camcommon::frameSizeFromIndex(index, g_frameSize, true);
 }
 
 int frameSizeToIndex(framesize_t size) {
-  switch (size) {
-    case FRAMESIZE_QVGA: return 0;
-    case FRAMESIZE_VGA: return 1;
-    case FRAMESIZE_SVGA: return 2;
-    case FRAMESIZE_XGA: return 3;
-    case FRAMESIZE_HD: return 4;
-    case FRAMESIZE_SXGA: return 5;
-    case FRAMESIZE_UXGA: return 6;
-    case FRAMESIZE_QXGA: return 7;
-    default: return 2;
-  }
+  return camcommon::frameSizeToIndex(size, 2);
 }
 
 const char *irModeName() {
@@ -144,8 +111,8 @@ const char *irModeName() {
 
 String rtspUrl() {
   if (WiFi.status() != WL_CONNECTED) return "";
-  return "rtsp://" + WiFi.localIP().toString() + ":" + String(dfrcfg::kRtspPort) + "/" +
-         dfrcfg::kRtspPresentation + "/" + dfrcfg::kRtspStream;
+  return camcommon::rtspUrl(
+      WiFi.localIP(), dfrcfg::kRtspPort, dfrcfg::kRtspPresentation, dfrcfg::kRtspStream);
 }
 
 String streamState() {
@@ -286,11 +253,9 @@ String buildConfigJson() {
   json += g_irEnabled ? "true" : "false";
   json += ",\"ir_on_lux\":" + String(g_irOnBelowLux, 1);
   json += ",\"ir_off_lux\":" + String(g_irOffAboveLux, 1);
-  json += ",\"timelapse_enabled\":";
-  json += dfrtimelapse::enabled() ? "true" : "false";
-  json += ",\"timelapse_interval_seconds\":" + String(dfrtimelapse::intervalSeconds());
-  json += ",\"timelapse_limit_gb\":" +
-          String(static_cast<double>(dfrtimelapse::storageLimitBytes()) / (1024.0 * 1024.0 * 1024.0), 1);
+  json += ",\"server_capture_enabled\":";
+  json += dfrcapture::enabled() ? "true" : "false";
+  json += ",\"server_capture_interval_seconds\":" + String(dfrcapture::intervalSeconds());
   json += ",\"psram\":";
   json += g_psramReady ? "true" : "false";
   json += "}";
@@ -306,7 +271,6 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/error", g_lastError);
   publishSimple("status/ip", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "-");
   publishSimple("status/rtsp_url", rtspUrl());
-  publishSimple("status/archive_url", "");
   publishSimple("status/mdns", String(dfrcfg::kMdnsHostname) + ".local");
   publishSimple("status/last_status", g_lastStatus);
   publishSimple("status/clients", String(directStreamingSessionCount()));
@@ -317,18 +281,9 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/ir_mode", irModeName());
   publishSimple("status/ir_enabled", g_irEnabled ? "true" : "false");
   publishSimple("status/light_sensor", g_lightReady ? "ready" : "unavailable");
-  publishSimple("status/sd", "not_used");
-
-  publishSimple("status/timelapse/state", dfrtimelapse::state());
-  publishSimple("status/timelapse/error", dfrtimelapse::error());
-  publishSimple("status/timelapse/storage_bytes", uint64String(dfrtimelapse::storageBytes()));
-  publishSimple("status/timelapse/storage_limit_bytes", uint64String(dfrtimelapse::storageLimitBytes()));
-  publishSimple("status/timelapse/card_total_bytes", uint64String(dfrtimelapse::cardTotalBytes()));
-  publishSimple("status/timelapse/card_used_bytes", uint64String(dfrtimelapse::cardUsedBytes()));
-  publishSimple("status/timelapse/last_image", dfrtimelapse::lastImage());
-  publishSimple("status/timelapse/output_dir", "server");
-  publishSimple("status/timelapse/enabled", dfrtimelapse::enabled() ? "true" : "false");
-  publishSimple("status/timelapse/interval_seconds", String(dfrtimelapse::intervalSeconds()));
+  publishSimple("status/capture_request/state", dfrcapture::state());
+  publishSimple("status/capture_request/enabled", dfrcapture::enabled() ? "true" : "false");
+  publishSimple("status/capture_request/interval_seconds", String(dfrcapture::intervalSeconds()));
 
   const String config = buildConfigJson();
   if (forceConfig || config != previousConfig) {
@@ -571,44 +526,11 @@ void ensureWifi() {
 }
 
 bool extractPayloadToken(const String &payload, const String &key, String &token) {
-  const String jsonKey = "\"" + key + "\"";
-  int keyPosition = payload.indexOf(jsonKey);
-  if (keyPosition < 0) return false;
-  int colon = payload.indexOf(':', keyPosition + jsonKey.length());
-  if (colon < 0) return false;
-
-  int start = colon + 1;
-  while (start < payload.length() && isspace(static_cast<unsigned char>(payload[start]))) ++start;
-  if (start >= payload.length()) return false;
-
-  if (payload[start] == '"') {
-    const int end = payload.indexOf('"', start + 1);
-    if (end < 0) return false;
-    token = payload.substring(start + 1, end);
-    return true;
-  }
-
-  int end = start;
-  while (end < payload.length() && payload[end] != ',' && payload[end] != '}') ++end;
-  token = payload.substring(start, end);
-  token.trim();
-  return token.length() > 0;
+  return camcommon::extractPayloadToken(payload, key.c_str(), token);
 }
 
 bool extractPayloadInt(const String &payload, const char *key, int &value) {
-  String token;
-  if (!extractPayloadToken(payload, key, token)) return false;
-  token.toLowerCase();
-  if (token == "true" || token == "on") {
-    value = 1;
-    return true;
-  }
-  if (token == "false" || token == "off") {
-    value = 0;
-    return true;
-  }
-  value = token.toInt();
-  return true;
+  return camcommon::extractPayloadInt(payload, key, value);
 }
 
 bool applySetting(const char *key, int value, bool &streamRebuildRequired, bool &cameraRestartRequired) {
@@ -682,18 +604,14 @@ bool applySetting(const char *key, int value, bool &streamRebuildRequired, bool 
     g_irOffAboveLux = bounded;
     if (g_irOffAboveLux <= g_irOnBelowLux) g_irOnBelowLux = max(0.0f, g_irOffAboveLux - 2.0f);
     evaluateIrAutomation();
-  } else if (strcmp(key, "timelapse_enabled") == 0) {
+  } else if (strcmp(key, "timelapse_enabled") == 0 || strcmp(key, "server_capture_enabled") == 0) {
     const bool enabled = value != 0;
-    if (enabled == dfrtimelapse::enabled()) return false;
-    dfrtimelapse::setEnabled(enabled);
-  } else if (strcmp(key, "timelapse_interval_seconds") == 0) {
+    if (enabled == dfrcapture::enabled()) return false;
+    dfrcapture::setEnabled(enabled);
+  } else if (strcmp(key, "timelapse_interval_seconds") == 0 || strcmp(key, "server_capture_interval_seconds") == 0) {
     const uint32_t bounded = static_cast<uint32_t>(max(5, value));
-    if (bounded == dfrtimelapse::intervalSeconds()) return false;
-    dfrtimelapse::setIntervalSeconds(bounded);
-  } else if (strcmp(key, "timelapse_limit_gb") == 0) {
-    const uint64_t bounded = static_cast<uint64_t>(max(1, value)) * 1024ULL * 1024ULL * 1024ULL;
-    if (bounded == dfrtimelapse::storageLimitBytes()) return false;
-    dfrtimelapse::setStorageLimitBytes(bounded);
+    if (bounded == dfrcapture::intervalSeconds()) return false;
+    dfrcapture::setIntervalSeconds(bounded);
   } else {
     return false;
   }
@@ -704,7 +622,8 @@ void applyControlPayload(const String &payload) {
   static const char *keys[] = {
       "framesize", "jpeg_quality", "stream_fps", "brightness", "contrast", "saturation",
       "sharpness", "hmirror", "vflip", "led", "stream_enabled", "ir_mode", "ir_on_lux",
-      "ir_off_lux", "timelapse_enabled", "timelapse_interval_seconds", "timelapse_limit_gb"};
+      "ir_off_lux", "server_capture_enabled", "server_capture_interval_seconds",
+      "timelapse_enabled", "timelapse_interval_seconds"};
 
   bool changed = false;
   bool streamRebuildRequired = false;
@@ -735,15 +654,11 @@ void applyTimelapsePayload(const String &payload) {
   int value = 0;
   bool changed = false;
   if (extractPayloadInt(payload, "enabled", value)) {
-    dfrtimelapse::setEnabled(value != 0);
+    dfrcapture::setEnabled(value != 0);
     changed = true;
   }
   if (extractPayloadInt(payload, "interval_seconds", value)) {
-    dfrtimelapse::setIntervalSeconds(static_cast<uint32_t>(max(5, value)));
-    changed = true;
-  }
-  if (extractPayloadInt(payload, "max_storage_gb", value)) {
-    dfrtimelapse::setStorageLimitBytes(static_cast<uint64_t>(max(1, value)) * 1024ULL * 1024ULL * 1024ULL);
+    dfrcapture::setIntervalSeconds(static_cast<uint32_t>(max(5, value)));
     changed = true;
   }
   if (!changed) setError("no supported timelapse setting in MQTT payload");
@@ -774,9 +689,9 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   } else if (topicText == mqttTopic("cmd/set")) {
     applyControlPayload(payloadText);
   } else if (topicText == mqttTopic("cmd/timelapse/start")) {
-    if (!dfrtimelapse::setEnabled(true)) setError("unable to start timelapse");
+    if (!dfrcapture::setEnabled(true)) setError("unable to start timelapse");
   } else if (topicText == mqttTopic("cmd/timelapse/stop")) {
-    dfrtimelapse::setEnabled(false);
+    dfrcapture::setEnabled(false);
   } else if (topicText == mqttTopic("cmd/timelapse/set")) {
     applyTimelapsePayload(payloadText);
   }
@@ -871,7 +786,7 @@ void updateRuntimeStats() {
       g_lastMeasuredFps,
       g_ambientLux,
       g_irEnabled ? "on" : "off",
-      dfrtimelapse::state().c_str());
+      dfrcapture::state().c_str());
   publishStatus();
 }
 
@@ -893,7 +808,7 @@ void setupController() {
   loadControllerSettings();
   initCamera();
   configureLightSensor();
-  dfrtimelapse::begin();
+  dfrcapture::begin();
 
   statusf(
       "flash=%luMB psram=%luMB heap=%luKB",

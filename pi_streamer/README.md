@@ -46,16 +46,13 @@ pi_streamer/config.json
 - `stream.bitrate`
 - `stream.sharpness`, `stream.brightness`, `stream.contrast`, `stream.saturation`
 
-### Timelapse fields
+### Server capture fields
 
-- `timelapse.enabled`
-  - starts the timelapse worker automatically
-- `timelapse.interval_seconds`
+- `server_capture.enabled`
+  - asks the Node server to capture snapshots from MediaMTX
+- `server_capture.interval_seconds`
   - one image every N seconds
-- `timelapse.max_storage_gb`
-  - per-camera limit enforced by the server
-
-The legacy fields `output_dir`, `jpeg_quality` and `storage_check_seconds` remain accepted for config compatibility, but the Pi no longer writes images locally.
+Storage limits are configured only on the Node server. The Pi never receives, reserves or writes archive storage.
 
 ### MQTT fields
 
@@ -115,9 +112,7 @@ camera/pi-zero-01
 
 ```json
 {
-  "interval_seconds": 60,
-  "max_storage_gb": 22.0,
-  "max_storage_gb": 22.0
+  "interval_seconds": 60
 }
 ```
 
@@ -129,14 +124,12 @@ camera/pi-zero-01
 - `camera/pi-zero-01/status/config`
 - `camera/pi-zero-01/status/target`
 - `camera/pi-zero-01/status/pong`
-- `camera/pi-zero-01/status/timelapse/state`
-- `camera/pi-zero-01/status/timelapse/error`
-- `camera/pi-zero-01/status/timelapse/storage_bytes`
-- `camera/pi-zero-01/status/timelapse/storage_limit_bytes`
-- `camera/pi-zero-01/status/timelapse/last_image`
-- `camera/pi-zero-01/status/timelapse/output_dir`
-- `camera/pi-zero-01/status/timelapse/enabled`
-- `camera/pi-zero-01/status/timelapse/interval_seconds`
+- `camera/pi-zero-01/status/capture_request/state`
+- `camera/pi-zero-01/status/capture_request/error`
+- `camera/pi-zero-01/status/capture_request/enabled`
+- `camera/pi-zero-01/status/capture_request/interval_seconds`
+
+Actual archive usage and capture results are published by the Node server below `status/server_capture/*`.
 
 ## Timelapse behavior
 

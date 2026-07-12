@@ -23,11 +23,7 @@ constexpr char kRtspPresentation[] = "mjpeg";
 constexpr char kRtspStream[] = "1";
 constexpr int kDefaultRtspFps = 10;
 
-constexpr uint16_t kArchivePort = 8080;
-constexpr char kArchiveToken[] = "1234";
-constexpr char kTimelapseDirectory[] = "/timelapse";
 constexpr uint32_t kDefaultTimelapseIntervalSeconds = 60;
-constexpr uint64_t kDefaultTimelapseLimitBytes = 22ULL * 1024ULL * 1024ULL * 1024ULL;
 
 constexpr float kDefaultIrOnBelowLux = 5.0f;
 constexpr float kDefaultIrOffAboveLux = 10.0f;
