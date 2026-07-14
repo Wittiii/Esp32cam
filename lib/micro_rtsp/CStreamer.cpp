@@ -250,6 +250,8 @@ bool CStreamer::InitUdpTransport(void)
 
 void CStreamer::ReleaseUdpTransport(void)
 {
+    if (m_udpRefCount == 0)
+        return;
     --m_udpRefCount;
     if (m_udpRefCount == 0)
     {

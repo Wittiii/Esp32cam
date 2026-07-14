@@ -29,6 +29,9 @@ CRtspSession::CRtspSession(SOCKET aClient, CStreamer * aStreamer) : LinkedListEl
 
     m_CSeq = 0; // CSeq sequense must be kept through the whole session
     m_RtspCmdType = RTSP_UNKNOWN;
+    m_RecvBufPos = 0;
+    m_HeaderState = headerUnknown;
+    memset(m_RecvBuf, 0x00, sizeof(m_RecvBuf));
     debug = false;
 }
 
@@ -354,16 +357,17 @@ bool CRtspSession::ParseRtspRequest( char * aRequest, unsigned aRequestSize )
 
 RTSP_CMD_TYPES CRtspSession::Handle_RtspRequest( char *aRequest, unsigned aRequestSize )
 {
-    if ( ParseRtspRequest( aRequest, aRequestSize ) )
+    if ( !ParseRtspRequest( aRequest, aRequestSize ) ) {
+        return RTSP_UNKNOWN;
+    }
+
+    switch ( m_RtspCmdType )
     {
-        switch ( m_RtspCmdType )
-        {
-            case RTSP_OPTIONS:  Handle_RtspOPTION();   break;
-            case RTSP_DESCRIBE: Handle_RtspDESCRIBE(); break;
-            case RTSP_SETUP:    Handle_RtspSETUP();    break;
-            case RTSP_PLAY:     Handle_RtspPLAY();     break;
-            default: break;
-        }
+        case RTSP_OPTIONS:  Handle_RtspOPTION();   break;
+        case RTSP_DESCRIBE: Handle_RtspDESCRIBE(); break;
+        case RTSP_SETUP:    Handle_RtspSETUP();    break;
+        case RTSP_PLAY:     Handle_RtspPLAY();     break;
+        default: break;
     }
 
     return m_RtspCmdType;
@@ -414,11 +418,11 @@ void CRtspSession::Handle_RtspDESCRIBE() // FIXME: too much redundancy. should e
     snprintf( SDPBuf, sizeof(SDPBuf),
              "v=0\r\n"
              "o=- %d 1 IN IP4 %s\r\n"
-             "s=\r\n"
+             "s=ESP32 Camera\r\n"
              "t=0 0\r\n"                                       // start / stop - 0 -> unbounded and permanent session
              "m=video 0 RTP/AVP 26\r\n"                        // currently we just handle UDP sessions (??????)
-             // "a=x-dimensions: 640,480\r\n"
-             "c=IN IP4 0.0.0.0\r\n",
+             "c=IN IP4 0.0.0.0\r\n"
+             "a=rtpmap:26 JPEG/90000\r\n",
              rand(),
              OBuf );
 
@@ -522,31 +526,31 @@ bool CRtspSession::handleRequests( uint32_t readTimeoutMs )
     if ( m_stopped )
         return false; // Already closed down
 
-    static unsigned bufPos = 0; // current position into receiving buffer. used to glue split requests.
-    static enum { hdrStateUnknown, hdrStateGotMethod, hdrStateInvalid } state = hdrStateUnknown;
-    static char RecvBuf[RTSP_BUFFER_SIZE];   // Note: we assume single threaded, this large buf we keep off of the tiny stack
-
-    if ( bufPos == 0 || bufPos >= sizeof( RecvBuf ) - 1 ) // in case of bad client
+    if ( m_RecvBufPos == 0 || m_RecvBufPos >= sizeof( m_RecvBuf ) - 1 ) // in case of bad client
     {
-        memset( RecvBuf, 0x00, sizeof( RecvBuf ) );
-        bufPos = 0;
-        state = hdrStateUnknown;
+        memset( m_RecvBuf, 0x00, sizeof( m_RecvBuf ) );
+        m_RecvBufPos = 0;
+        m_HeaderState = headerUnknown;
     }
 
     // we always read 1 byte less than the buffer length, so all string ops here will not panic
-    int res = socketread( m_RtspClient, RecvBuf + bufPos, sizeof( RecvBuf ) - bufPos - 1, readTimeoutMs );
+    int res = socketread(
+        m_RtspClient,
+        m_RecvBuf + m_RecvBufPos,
+        sizeof( m_RecvBuf ) - m_RecvBufPos - 1,
+        readTimeoutMs );
     if ( res > 0 )
     {
-        bufPos += res;
-        RecvBuf[ bufPos ] = '\0';
+        m_RecvBufPos += res;
+        m_RecvBuf[ m_RecvBufPos ] = '\0';
 
         if ( debug ) printf( "+ read %d bytes\n", res );
 
-        if ( state == hdrStateUnknown && bufPos >= 6 ) // we need at least 4-letter at the line start with optional heading CRLF
+        if ( m_HeaderState == headerUnknown && m_RecvBufPos >= 6 ) // we need at least 4-letter at the line start with optional heading CRLF
         {
-            if( NULL != strstr( RecvBuf, "\r\n" ) ) // got a full line
+            if( NULL != strstr( m_RecvBuf, "\r\n" ) ) // got a full line
             {
-                char *s = RecvBuf;
+                char *s = m_RecvBuf;
                 if ( *s == '\r' && *(s + 1) == '\n' ) // skip allowed empty line at front
                     s += 2;
 
@@ -561,32 +565,32 @@ bool CRtspSession::handleRequests( uint32_t readTimeoutMs )
                 else if ( strncmp( s, "TEARDOWN ", 9 )  == 0 ) m_RtspCmdType = RTSP_TEARDOWN;
 
                 if( m_RtspCmdType != RTSP_UNKNOWN ) // got some
-                    state = hdrStateGotMethod;
+                    m_HeaderState = headerGotMethod;
                 else
-                    state = hdrStateInvalid;
+                    m_HeaderState = headerInvalid;
             }
-        } // if state == hdrStateUnknown
+        } // if state == headerUnknown
 
-        if ( state != hdrStateUnknown ) // in all cases we need to slurp the whole header before answering
+        if ( m_HeaderState != headerUnknown ) // in all cases we need to slurp the whole header before answering
         {
             // per https://tools.ietf.org/html/rfc2326 we need to look for an empty line
             // to be sure that we got the correctly formed header. Also starting CRLF should be ignored.
-            char *s = strstr( bufPos > 4 ? RecvBuf + bufPos - 4 : RecvBuf, "\r\n\r\n" ); // try to save cycles by searching in the new data only
+            char *s = strstr( m_RecvBuf, "\r\n\r\n" );
             
             if ( s == NULL ) // no end of header seen yet
                 return true;
 
-            if ( state == hdrStateInvalid ) // tossing some immediate answer, so client don't fall into endless stupor
+            if ( m_HeaderState == headerInvalid ) // tossing some immediate answer, so client don't fall into endless stupor
             {
                 // not sure which code is more appropriate and if CSeq is needed here?
-                int l = snprintf( RecvBuf, sizeof(RecvBuf), "RTSP/1.0 400 Bad Request\r\nCSeq: %u\r\n\r\n", m_CSeq );
-                socketsend( m_RtspClient, RecvBuf, l );
-                bufPos = 0;
+                int l = snprintf( m_RecvBuf, sizeof(m_RecvBuf), "RTSP/1.0 400 Bad Request\r\nCSeq: %u\r\n\r\n", m_CSeq );
+                socketsend( m_RtspClient, m_RecvBuf, l );
+                m_RecvBufPos = 0;
                 return false;
             }
         }
 
-        RTSP_CMD_TYPES C = Handle_RtspRequest( RecvBuf, res );
+        RTSP_CMD_TYPES C = Handle_RtspRequest( m_RecvBuf, m_RecvBufPos );
 
         if ( C == RTSP_PLAY )
             m_streaming = true;
@@ -595,8 +599,8 @@ bool CRtspSession::handleRequests( uint32_t readTimeoutMs )
             m_stopped = true;
 
         // cleaning up
-        state = hdrStateUnknown;
-        bufPos = 0;
+        m_HeaderState = headerUnknown;
+        m_RecvBufPos = 0;
 
         return true;
     } // res > 0

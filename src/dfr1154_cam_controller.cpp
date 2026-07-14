@@ -358,6 +358,7 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/wifi_rssi", String(WiFi.RSSI()));
   publishSimple("status/uptime_seconds", String(millis() / 1000UL));
   publishSimple("status/free_heap_bytes", String(ESP.getFreeHeap()));
+  publishSimple("status/firmware_version", camcommon::kFirmwareVersion);
   publishSimple("status/wifi_reconnect_count", String(g_wifiReconnectCount));
   publishSimple("status/mqtt_reconnect_count", String(g_mqttReconnectCount));
   publishSimple("status/camera_recovery_count", String(g_cameraRecoveryCount));

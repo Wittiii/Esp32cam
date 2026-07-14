@@ -15,7 +15,7 @@ enum RTSP_CMD_TYPES
     RTSP_UNKNOWN
 };
 
-#define RTSP_BUFFER_SIZE       10000    // for incoming requests, and outgoing responses
+#define RTSP_BUFFER_SIZE       4096     // RTSP headers are small; keep one buffer per client.
 #define RTSP_PARAM_STRING_MAX  200
 #define MAX_HOSTNAME_LEN       256
 
@@ -47,6 +47,8 @@ public:
 
     bool debug; /// set to true to get a load of output
 private:
+    enum HeaderState { headerUnknown, headerGotMethod, headerInvalid };
+
     void newCommandInit();
     bool ParseRtspRequest( char * aRequest, unsigned aRequestSize );
     char const * DateHeader();
@@ -77,4 +79,7 @@ private:
 
     uint16_t m_RtpClientPort;      // RTP receiver port on client (in host byte order!)
     uint16_t m_RtcpClientPort;     // RTCP receiver port on client (in host byte order!)
+    unsigned m_RecvBufPos;
+    HeaderState m_HeaderState;
+    char m_RecvBuf[RTSP_BUFFER_SIZE];
 };

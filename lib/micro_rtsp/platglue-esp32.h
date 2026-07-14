@@ -71,13 +71,20 @@ inline ssize_t sockettrysend(SOCKET sockfd, const void *buf, size_t len)
 {
     if (!sockfd || !sockfd->connected() || sockfd->fd() < 0) return -1;
 
+    const uint8_t *bytes = static_cast<const uint8_t *>(buf);
+    size_t totalSent = 0;
     const uint32_t startedAt = millis();
-    while (millis() - startedAt < 20) {
-        const ssize_t sent = ::send(sockfd->fd(), buf, len, MSG_DONTWAIT);
-        if (sent == static_cast<ssize_t>(len)) return sent;
-        if (sent > 0 || (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) break;
-        delay(0);
+    while (totalSent < len && millis() - startedAt < 100) {
+        const ssize_t sent = ::send(
+            sockfd->fd(), bytes + totalSent, len - totalSent, MSG_DONTWAIT);
+        if (sent > 0) {
+            totalSent += static_cast<size_t>(sent);
+            continue;
+        }
+        if (sent == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
+        delay(1);
     }
+    if (totalSent == len) return static_cast<ssize_t>(totalSent);
     sockfd->stop();
     return -1;
 }
@@ -117,9 +124,7 @@ inline int socketread(SOCKET sock, char *buf, size_t buflen, int timeoutmsec)
         return -1;
     }
     else {
-        // int numRead = sock->readBytesUntil('\n', buf, buflen);
-        int numRead = sock->readBytes(buf, buflen);
-        // printf("bytes avail %d, read %d: %s", numAvail, numRead, buf);
-        return numRead;
+        const size_t bytesToRead = min(static_cast<size_t>(numAvail), buflen);
+        return sock->read(reinterpret_cast<uint8_t *>(buf), bytesToRead);
     }
 }
