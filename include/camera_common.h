@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <cctype>
 #include <esp_camera.h>
+#include <limits.h>
+#include <stdlib.h>
 
 namespace camcommon {
 
@@ -95,7 +97,15 @@ inline bool extractPayloadInt(const String &payload, const char *key, int &value
   token.toLowerCase();
   if (token == "true" || token == "on") value = 1;
   else if (token == "false" || token == "off") value = 0;
-  else value = token.toInt();
+  else {
+    char *end = nullptr;
+    const long parsed = strtol(token.c_str(), &end, 10);
+    while (end != nullptr && *end != '\0' && isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end == token.c_str() || end == nullptr || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
+      return false;
+    }
+    value = static_cast<int>(parsed);
+  }
   return true;
 }
 

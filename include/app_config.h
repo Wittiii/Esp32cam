@@ -26,6 +26,7 @@ constexpr uint16_t kRtspPort = 8554;
 constexpr char kRtspPresentation[] = "mjpeg";
 constexpr char kRtspStream[] = "1";
 constexpr int kDefaultRtspFps = 12;
+constexpr uint32_t kDefaultServerCaptureIntervalSeconds = 60;
 
 constexpr uint32_t kFrameErrorReportMs = 5000;
 constexpr uint32_t kWifiRetryMs = 5000;

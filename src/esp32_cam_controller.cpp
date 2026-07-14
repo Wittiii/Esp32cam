@@ -39,6 +39,14 @@ bool g_rtspServerStarted = false;
 bool g_mdnsReady = false;
 bool g_cameraReady = false;
 bool g_streamEnabled = true;
+bool g_networkServicesPending = false;
+bool g_otaReady = false;
+bool g_otaActive = false;
+bool g_mqttEverConnected = false;
+
+volatile bool g_wifiGotIpEvent = false;
+volatile bool g_wifiDisconnectedEvent = false;
+volatile uint8_t g_wifiDisconnectReason = 0;
 
 framesize_t g_frameSize = FRAMESIZE_VGA;
 int g_jpegQuality = 12;
@@ -50,6 +58,8 @@ int g_hmirror = 0;
 int g_vflip = 0;
 int g_ledEnabled = 0;
 int g_streamFps = appcfg::kDefaultRtspFps;
+bool g_serverCaptureEnabled = true;
+uint32_t g_serverCaptureIntervalSeconds = appcfg::kDefaultServerCaptureIntervalSeconds;
 
 String g_lastStatus;
 String g_lastError;
@@ -59,7 +69,22 @@ uint32_t g_lastMqttAttemptMs = 0;
 uint32_t g_lastFrameAtMs = 0;
 uint32_t g_lastStatsMs = 0;
 uint32_t g_framesSent = 0;
+uint32_t g_lastCameraHealthCheckMs = 0;
+uint32_t g_lastCameraRecoveryAttemptMs = 0;
+uint32_t g_wifiReconnectCount = 0;
+uint32_t g_mqttReconnectCount = 0;
+uint32_t g_cameraRecoveryCount = 0;
+uint32_t g_mqttPublishFailures = 0;
+uint8_t g_wifiAttemptCount = 0;
+uint8_t g_cameraRecoveryFailures = 0;
+bool g_cameraRecoveryPending = false;
 float g_lastMeasuredFps = 0.0f;
+
+String g_lastCommandId;
+String g_lastCommandName;
+String g_lastCommandResult = "none";
+String g_lastCommandMessage;
+uint32_t g_lastCommandAtMs = 0;
 
 int directSessionCount() {
   return g_streamer != nullptr ? g_streamer->sessionCount() : 0;
@@ -162,6 +187,12 @@ void statusf(const char *format, ...) {
 }
 
 String streamState() {
+  if (g_otaActive) {
+    return "updating";
+  }
+  if (g_cameraRecoveryPending) {
+    return "recovering";
+  }
   if (!g_cameraReady) {
     return "camera_error";
   }
@@ -175,6 +206,18 @@ String streamState() {
     return "streaming";
   }
   return "ready";
+}
+
+void setCommandResult(
+    const String &command,
+    const String &requestId,
+    const String &result,
+    const String &message) {
+  g_lastCommandName = command;
+  g_lastCommandId = requestId;
+  g_lastCommandResult = result;
+  g_lastCommandMessage = message;
+  g_lastCommandAtMs = millis();
 }
 
 void applyLedState(int enabled) {
@@ -206,6 +249,7 @@ void rebuildStreamer() {
   esp_camera_fb_return(probe);
 
   g_streamer.reset(new Esp32RtspStreamer(width, height));
+  g_streamer->setNonBlockingTcpWrites(true);
   String hostPort = WiFi.localIP().toString();
   hostPort += ":";
   hostPort += String(appcfg::kRtspPort);
@@ -227,11 +271,14 @@ void publishSimple(const char *suffix, const String &value, bool retain = true) 
   if (!g_mqttClient.connected()) {
     return;
   }
-  g_mqttClient.publish(mqttTopic(suffix).c_str(), value.c_str(), retain);
+  if (!g_mqttClient.publish(mqttTopic(suffix).c_str(), value.c_str(), retain)) {
+    ++g_mqttPublishFailures;
+  }
 }
 
 String buildConfigJson() {
   String json = "{";
+  json.reserve(384);
   json += "\"framesize\":";
   json += String(frameSizeToIndex(g_frameSize));
   json += ",\"framesize_name\":\"";
@@ -256,6 +303,10 @@ String buildConfigJson() {
   json += String(g_streamFps);
   json += ",\"stream_enabled\":";
   json += g_streamEnabled ? "true" : "false";
+  json += ",\"server_capture_enabled\":";
+  json += g_serverCaptureEnabled ? "true" : "false";
+  json += ",\"server_capture_interval_seconds\":";
+  json += String(g_serverCaptureIntervalSeconds);
   json += ",\"psram\":";
   json += g_psramAvailable ? "true" : "false";
   json += "}";
@@ -280,6 +331,23 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/direct_sessions", String(directSessionCount()));
   publishSimple("status/direct_streaming_clients", String(directStreamingSessionCount()));
   publishSimple("status/frame_fps", String(g_lastMeasuredFps, 1));
+  publishSimple("status/configured_fps", String(g_streamFps));
+  publishSimple("status/mqtt_connected", "true");
+  publishSimple("status/wifi_rssi", String(WiFi.RSSI()));
+  publishSimple("status/uptime_seconds", String(millis() / 1000UL));
+  publishSimple("status/free_heap_bytes", String(ESP.getFreeHeap()));
+  publishSimple("status/wifi_reconnect_count", String(g_wifiReconnectCount));
+  publishSimple("status/mqtt_reconnect_count", String(g_mqttReconnectCount));
+  publishSimple("status/camera_recovery_count", String(g_cameraRecoveryCount));
+  publishSimple("status/mqtt_publish_failures", String(g_mqttPublishFailures));
+  publishSimple("status/capture_request/state", g_serverCaptureEnabled ? "enabled" : "disabled");
+  publishSimple("status/capture_request/enabled", g_serverCaptureEnabled ? "true" : "false");
+  publishSimple("status/capture_request/interval_seconds", String(g_serverCaptureIntervalSeconds));
+  publishSimple("status/command/id", g_lastCommandId);
+  publishSimple("status/command/name", g_lastCommandName);
+  publishSimple("status/command/result", g_lastCommandResult);
+  publishSimple("status/command/message", g_lastCommandMessage);
+  publishSimple("status/command/at_ms", String(g_lastCommandAtMs));
 
   const String config = buildConfigJson();
   if (forceConfig || config != lastConfig) {
@@ -305,22 +373,32 @@ void configureMdns() {
 }
 
 void configureOta() {
+  if (g_otaReady || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
   ArduinoOTA.setHostname(appcfg::kOtaHostname);
   if (strlen(appcfg::kOtaPassword) > 0) {
     ArduinoOTA.setPassword(appcfg::kOtaPassword);
   }
 
+  ArduinoOTA.setMdnsEnabled(false);
   ArduinoOTA.onStart([]() {
-    recordStatus("ota update started");
+    g_otaActive = true;
+    g_streamer.reset();
+    recordStatus("ota update started; camera stream suspended");
   });
   ArduinoOTA.onEnd([]() {
     recordStatus("ota update finished");
   });
   ArduinoOTA.onError([](ota_error_t error) {
+    g_otaActive = false;
     statusf("ota error=%u", static_cast<uint32_t>(error));
+    rebuildStreamer();
   });
+  ArduinoOTA.onProgress([](unsigned int, unsigned int) { feedLoopWDT(); });
 
   ArduinoOTA.begin();
+  g_otaReady = true;
   statusf("ota ready host=%s", appcfg::kOtaHostname);
 }
 
@@ -397,6 +475,8 @@ void saveControllerSettings() {
   g_preferences.putInt("vflip", g_vflip);
   g_preferences.putBool("led", g_ledEnabled != 0);
   g_preferences.putBool("stream", g_streamEnabled);
+  g_preferences.putBool("capture", g_serverCaptureEnabled);
+  g_preferences.putUInt("capinterval", g_serverCaptureIntervalSeconds);
 }
 
 void loadControllerSettings() {
@@ -411,9 +491,15 @@ void loadControllerSettings() {
   g_vflip = g_preferences.getInt("vflip", 0) ? 1 : 0;
   g_ledEnabled = g_preferences.getBool("led", false) ? 1 : 0;
   g_streamEnabled = g_preferences.getBool("stream", true);
+  g_serverCaptureEnabled = g_preferences.getBool("capture", true);
+  g_serverCaptureIntervalSeconds = constrain(
+      g_preferences.getUInt("capinterval", appcfg::kDefaultServerCaptureIntervalSeconds),
+      5UL,
+      86400UL);
 }
 
 bool initCamera() {
+  g_cameraReady = false;
   g_psramAvailable = psramFound();
   g_frameSize = g_psramAvailable ? FRAMESIZE_SVGA : FRAMESIZE_VGA;
   g_jpegQuality = g_psramAvailable ? 8 : 10;
@@ -462,16 +548,79 @@ bool initCamera() {
     return false;
   }
 
+  const int desiredLedState = g_ledEnabled;
   pinMode(LED_GPIO_NUM, OUTPUT);
-  applyLedState(0);
+  applyLedState(desiredLedState);
 
   g_cameraReady = true;
   applySensorSettings(false);
+  g_cameraRecoveryFailures = 0;
+  g_cameraRecoveryPending = false;
   statusf(
       "camera ready psram=%s frame=%s",
       g_psramAvailable ? "yes" : "no",
       frameSizeName());
   return true;
+}
+
+void shutdownCamera() {
+  g_streamer.reset();
+  if (!g_cameraReady) return;
+  esp_camera_deinit();
+  g_cameraReady = false;
+}
+
+bool restartCameraPipeline() {
+  recordStatus("camera reconfiguring");
+  shutdownCamera();
+  delay(50);
+  if (!initCamera()) return false;
+  rebuildStreamer();
+  clearLastError();
+  return true;
+}
+
+void requestCameraRecovery(const String &reason) {
+  if (!g_cameraRecoveryPending) {
+    statusf("camera recovery requested: %s", reason.c_str());
+  }
+  g_cameraRecoveryPending = true;
+}
+
+void handleCameraRecovery() {
+  const uint32_t now = millis();
+  if (g_cameraReady && !g_cameraRecoveryPending) {
+    if (!g_streamEnabled || directStreamingSessionCount() > 0 ||
+        now - g_lastCameraHealthCheckMs < 30000UL) {
+      return;
+    }
+    g_lastCameraHealthCheckMs = now;
+    camera_fb_t *frame = esp_camera_fb_get();
+    if (frame != nullptr) {
+      esp_camera_fb_return(frame);
+      return;
+    }
+    requestCameraRecovery("health probe failed");
+  }
+
+  if (g_cameraReady && !g_cameraRecoveryPending) return;
+  if (now - g_lastCameraRecoveryAttemptMs < 10000UL) return;
+  g_lastCameraRecoveryAttemptMs = now;
+  ++g_cameraRecoveryCount;
+
+  if (restartCameraPipeline()) {
+    g_cameraRecoveryFailures = 0;
+    g_cameraRecoveryPending = false;
+    statusf("camera recovery successful count=%lu", g_cameraRecoveryCount);
+    return;
+  }
+
+  ++g_cameraRecoveryFailures;
+  if (g_cameraRecoveryFailures >= 3) {
+    statusf("camera recovery failed %u times; rebooting", g_cameraRecoveryFailures);
+    delay(100);
+    ESP.restart();
+  }
 }
 
 void ensureWifi() {
@@ -480,11 +629,12 @@ void ensureWifi() {
   }
 
   const uint32_t now = millis();
-  if (now - g_lastWifiAttemptMs < appcfg::kWifiRetryMs) {
+  if (g_lastWifiAttemptMs != 0 && now - g_lastWifiAttemptMs < appcfg::kWifiRetryMs) {
     return;
   }
 
   g_lastWifiAttemptMs = now;
+  ++g_wifiAttemptCount;
 
   if (!g_wifiStartIssued) {
     g_wifiStartIssued = true;
@@ -493,8 +643,15 @@ void ensureWifi() {
     return;
   }
 
-  recordStatus("wifi reconnecting");
-  WiFi.reconnect();
+  if (g_wifiAttemptCount % 6 == 0) {
+    recordStatus("wifi stack reconnect");
+    WiFi.disconnect(false, false);
+    delay(20);
+    WiFi.begin(appcfg::kWifiSsid, appcfg::kWifiPassword);
+  } else {
+    recordStatus("wifi reconnecting");
+    WiFi.reconnect();
+  }
 }
 
 void mqttCallback(char *topic, byte *payload, unsigned int length);
@@ -518,7 +675,8 @@ void ensureMqtt() {
   g_mqttClient.setServer(appcfg::kMqttHost, appcfg::kMqttPort);
   g_mqttClient.setCallback(mqttCallback);
   g_mqttClient.setSocketTimeout(1);
-  g_mqttClient.setBufferSize(512);
+  g_mqttClient.setKeepAlive(20);
+  g_mqttClient.setBufferSize(1024);
 
   const String willTopic = mqttTopic("status/online");
   bool connected = false;
@@ -541,42 +699,77 @@ void ensureMqtt() {
   }
 
   if (!connected) {
+    g_mqttSocket.stop();
     statusf("mqtt connect failed rc=%d", g_mqttClient.state());
     return;
   }
 
-  g_mqttClient.subscribe(mqttTopic("cmd/start").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/stop").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/restart").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/set").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/ping").c_str());
+  if (g_mqttEverConnected) ++g_mqttReconnectCount;
+  g_mqttEverConnected = true;
+
+  g_mqttClient.subscribe(mqttTopic("cmd/start").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/stop").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/restart").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/set").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/ping").c_str(), 1);
   statusf("mqtt connected topic=%s", appcfg::kMqttBaseTopic);
   publishStatus(true);
 }
 
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
-    case ARDUINO_EVENT_WIFI_STA_START:
-      recordStatus("wifi station started");
-      break;
-    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      recordStatus("wifi access point connected");
-      break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      statusf("wifi ip=%s", WiFi.localIP().toString().c_str());
-      configureMdns();
-      ensureRtspServer();
-      rebuildStreamer();
+      g_wifiGotIpEvent = true;
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      statusf("wifi disconnected reason=%d", info.wifi_sta_disconnected.reason);
-      g_mqttClient.disconnect();
-      g_lastMqttAttemptMs = 0;
-      g_streamer.reset();
+      g_wifiDisconnectReason = info.wifi_sta_disconnected.reason;
+      g_wifiDisconnectedEvent = true;
       break;
     default:
       break;
   }
+}
+
+void handleWifiEvents() {
+  if (g_wifiDisconnectedEvent) {
+    g_wifiDisconnectedEvent = false;
+    ++g_wifiReconnectCount;
+    g_lastWifiAttemptMs = 0;
+    g_otaActive = false;
+    g_streamer.reset();
+    g_rtspServer.end();
+    g_rtspServerStarted = false;
+    if (g_mqttClient.connected()) g_mqttClient.disconnect();
+    g_mqttSocket.stop();
+    g_lastMqttAttemptMs = 0;
+    if (g_otaReady) {
+      ArduinoOTA.end();
+      g_otaReady = false;
+    }
+    if (g_mdnsReady) {
+      MDNS.end();
+      g_mdnsReady = false;
+    }
+    g_networkServicesPending = false;
+    statusf("wifi disconnected reason=%u", g_wifiDisconnectReason);
+  }
+
+  if (g_wifiGotIpEvent) {
+    g_wifiGotIpEvent = false;
+    g_wifiAttemptCount = 0;
+    g_lastWifiAttemptMs = 0;
+    statusf("wifi ip=%s", WiFi.localIP().toString().c_str());
+    g_networkServicesPending = true;
+  }
+}
+
+void handleNetworkServices() {
+  if (!g_networkServicesPending || WiFi.status() != WL_CONNECTED) return;
+  g_networkServicesPending = false;
+  configureMdns();
+  configureOta();
+  ensureRtspServer();
+  rebuildStreamer();
 }
 
 bool extractPayloadToken(const String &payload, const String &key, String &token) {
@@ -587,109 +780,149 @@ bool extractPayloadInt(const String &payload, const char *key, int &value) {
   return camcommon::extractPayloadInt(payload, key, value);
 }
 
-bool applySettingByKey(const char *key, int value, bool &rebuildRequired) {
-  sensor_t *sensor = esp_camera_sensor_get();
-  if (sensor == nullptr) {
-    setLastError("camera sensor unavailable");
+bool applySettingByKey(
+    const char *key,
+    int value,
+    bool &rebuildRequired,
+    bool &recognized,
+    bool &failed) {
+  recognized = true;
+  const bool needsSensor =
+      strcmp(key, "framesize") == 0 || strcmp(key, "jpeg_quality") == 0 ||
+      strcmp(key, "brightness") == 0 || strcmp(key, "contrast") == 0 ||
+      strcmp(key, "saturation") == 0 || strcmp(key, "sharpness") == 0 ||
+      strcmp(key, "hmirror") == 0 || strcmp(key, "vflip") == 0;
+  sensor_t *sensor = needsSensor ? esp_camera_sensor_get() : nullptr;
+  if (needsSensor && sensor == nullptr) {
+    failed = true;
+    requestCameraRecovery("sensor unavailable while applying settings");
     return false;
   }
 
   if (strcmp(key, "framesize") == 0) {
-    const framesize_t newSize = frameSizeFromIndex(value);
-    if (newSize != g_frameSize && sensor->set_framesize(sensor, newSize) == 0) {
-      g_frameSize = newSize;
-      rebuildRequired = true;
-      return true;
+    const framesize_t bounded = frameSizeFromIndex(clampValue(value, 0, 6));
+    if (bounded == g_frameSize) return false;
+    if (sensor->set_framesize(sensor, bounded) != 0) {
+      failed = true;
+      return false;
     }
-    return false;
+    g_frameSize = bounded;
+    rebuildRequired = true;
+    return true;
   }
   if (strcmp(key, "jpeg_quality") == 0) {
     const int bounded = clampValue(value, 4, 63);
-    if (bounded != g_jpegQuality && sensor->set_quality(sensor, bounded) == 0) {
-      g_jpegQuality = bounded;
-      return true;
+    if (bounded == g_jpegQuality) return false;
+    if (sensor->set_quality(sensor, bounded) != 0) {
+      failed = true;
+      return false;
     }
-    return false;
+    g_jpegQuality = bounded;
+    return true;
   }
   if (strcmp(key, "brightness") == 0) {
     const int bounded = clampValue(value, -2, 2);
-    if (bounded != g_brightness && sensor->set_brightness(sensor, bounded) == 0) {
-      g_brightness = bounded;
-      return true;
+    if (bounded == g_brightness) return false;
+    if (sensor->set_brightness(sensor, bounded) != 0) {
+      failed = true;
+      return false;
     }
-    return false;
+    g_brightness = bounded;
+    return true;
   }
   if (strcmp(key, "contrast") == 0) {
     const int bounded = clampValue(value, -2, 2);
-    if (bounded != g_contrast && sensor->set_contrast(sensor, bounded) == 0) {
-      g_contrast = bounded;
-      return true;
+    if (bounded == g_contrast) return false;
+    if (sensor->set_contrast(sensor, bounded) != 0) {
+      failed = true;
+      return false;
     }
-    return false;
+    g_contrast = bounded;
+    return true;
   }
   if (strcmp(key, "saturation") == 0) {
     const int bounded = clampValue(value, -2, 2);
-    if (bounded != g_saturation && sensor->set_saturation(sensor, bounded) == 0) {
-      g_saturation = bounded;
-      return true;
+    if (bounded == g_saturation) return false;
+    if (sensor->set_saturation(sensor, bounded) != 0) {
+      failed = true;
+      return false;
     }
-    return false;
+    g_saturation = bounded;
+    return true;
   }
   if (strcmp(key, "sharpness") == 0) {
     const int bounded = clampValue(value, -2, 2);
-    if (bounded != g_sharpness && sensor->set_sharpness(sensor, bounded) == 0) {
-      g_sharpness = bounded;
-      return true;
+    if (bounded == g_sharpness) return false;
+    if (sensor->set_sharpness(sensor, bounded) != 0) {
+      failed = true;
+      return false;
     }
-    return false;
+    g_sharpness = bounded;
+    return true;
   }
   if (strcmp(key, "hmirror") == 0) {
     const int bounded = value ? 1 : 0;
-    if (bounded != g_hmirror && sensor->set_hmirror(sensor, bounded) == 0) {
-      g_hmirror = bounded;
-      return true;
+    if (bounded == g_hmirror) return false;
+    if (sensor->set_hmirror(sensor, bounded) != 0) {
+      failed = true;
+      return false;
     }
-    return false;
+    g_hmirror = bounded;
+    return true;
   }
   if (strcmp(key, "vflip") == 0) {
     const int bounded = value ? 1 : 0;
-    if (bounded != g_vflip && sensor->set_vflip(sensor, bounded) == 0) {
-      g_vflip = bounded;
-      return true;
+    if (bounded == g_vflip) return false;
+    if (sensor->set_vflip(sensor, bounded) != 0) {
+      failed = true;
+      return false;
     }
-    return false;
+    g_vflip = bounded;
+    return true;
   }
   if (strcmp(key, "led") == 0) {
     const int bounded = value ? 1 : 0;
-    if (bounded != g_ledEnabled) {
-      applyLedState(bounded);
-      return true;
-    }
-    return false;
+    if (bounded == g_ledEnabled) return false;
+    applyLedState(bounded);
+    return true;
   }
   if (strcmp(key, "stream_fps") == 0) {
     const int bounded = clampValue(value, 1, 25);
-    if (bounded != g_streamFps) {
-      g_streamFps = bounded;
-      return true;
-    }
-    return false;
+    if (bounded == g_streamFps) return false;
+    g_streamFps = bounded;
+    return true;
   }
   if (strcmp(key, "stream_enabled") == 0) {
     const bool enabled = value != 0;
-    if (enabled != g_streamEnabled) {
-      g_streamEnabled = enabled;
-      rebuildRequired = true;
-      return true;
-    }
-    return false;
+    if (enabled == g_streamEnabled) return false;
+    g_streamEnabled = enabled;
+    rebuildRequired = true;
+    return true;
+  }
+  if (strcmp(key, "server_capture_enabled") == 0 || strcmp(key, "timelapse_enabled") == 0) {
+    const bool enabled = value != 0;
+    if (enabled == g_serverCaptureEnabled) return false;
+    g_serverCaptureEnabled = enabled;
+    return true;
+  }
+  if (strcmp(key, "server_capture_interval_seconds") == 0 ||
+      strcmp(key, "timelapse_interval_seconds") == 0) {
+    const uint32_t bounded = static_cast<uint32_t>(constrain(value, 5, 86400));
+    if (bounded == g_serverCaptureIntervalSeconds) return false;
+    g_serverCaptureIntervalSeconds = bounded;
+    return true;
   }
 
+  recognized = false;
   return false;
 }
 
 void applyControlPayload(const String &payload) {
+  String requestId;
+  extractPayloadToken(payload, "_request_id", requestId);
+  bool recognizedAny = false;
   bool changed = false;
+  bool failed = false;
   bool rebuildRequired = false;
   int value = 0;
 
@@ -705,6 +938,10 @@ void applyControlPayload(const String &payload) {
       "led",
       "stream_fps",
       "stream_enabled",
+      "server_capture_enabled",
+      "server_capture_interval_seconds",
+      "timelapse_enabled",
+      "timelapse_interval_seconds",
   };
 
   for (const char *key : keys) {
@@ -712,9 +949,18 @@ void applyControlPayload(const String &payload) {
       continue;
     }
 
-    if (applySettingByKey(key, value, rebuildRequired)) {
+    bool recognized = false;
+    if (applySettingByKey(key, value, rebuildRequired, recognized, failed)) {
       changed = true;
     }
+    recognizedAny = recognizedAny || recognized;
+  }
+
+  if (!recognizedAny) {
+    setCommandResult("set", requestId, "error", "no supported setting in payload");
+    setLastError("no supported setting in MQTT payload");
+    publishStatus(true);
+    return;
   }
 
   if (rebuildRequired) {
@@ -723,17 +969,22 @@ void applyControlPayload(const String &payload) {
 
   if (changed) {
     saveControllerSettings();
-    clearLastError();
     statusf(
         "camera control applied frame=%s q=%d fps=%d led=%d",
         frameSizeName(),
         g_jpegQuality,
         g_streamFps,
         g_ledEnabled);
-    publishStatus(true);
-  } else {
-    publishStatus();
   }
+
+  if (failed) {
+    setCommandResult("set", requestId, changed ? "partial" : "error", "one or more settings failed");
+    setLastError("one or more camera settings failed");
+  } else {
+    clearLastError();
+    setCommandResult("set", requestId, "ok", changed ? "settings applied" : "settings already active");
+  }
+  publishStatus(true);
 }
 
 void mqttCallback(char *topic, byte *payload, unsigned int length) {
@@ -744,11 +995,15 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
     payloadText += static_cast<char>(payload[i]);
   }
   payloadText.trim();
+  String requestId;
+  extractPayloadToken(payloadText, "_request_id", requestId);
 
   if (topicText == mqttTopic("cmd/start")) {
     g_streamEnabled = true;
     saveControllerSettings();
     rebuildStreamer();
+    clearLastError();
+    setCommandResult("start", requestId, "ok", "stream enabled");
     recordStatus("mqtt start command");
     return;
   }
@@ -757,19 +1012,25 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
     g_streamEnabled = false;
     saveControllerSettings();
     rebuildStreamer();
+    setCommandResult("stop", requestId, "ok", "stream disabled");
     recordStatus("mqtt stop command");
     return;
   }
 
   if (topicText == mqttTopic("cmd/restart")) {
+    setCommandResult("restart", requestId, "ok", "device rebooting");
     recordStatus("mqtt restart command");
+    publishStatus(true);
+    g_mqttClient.loop();
     delay(100);
     ESP.restart();
     return;
   }
 
   if (topicText == mqttTopic("cmd/ping")) {
-    publishSimple("status/pong", payloadText.length() > 0 ? payloadText : "pong");
+    publishSimple("status/pong", requestId.length() > 0 ? requestId : (payloadText.length() > 0 ? payloadText : "pong"));
+    setCommandResult("ping", requestId, "ok", "pong");
+    publishStatus();
     return;
   }
 
@@ -835,7 +1096,11 @@ void handleRtspLoop() {
       (now - g_lastFrameAtMs >= frameIntervalMs || now < g_lastFrameAtMs)) {
     g_streamer->streamImage(now);
     g_lastFrameAtMs = now;
-    ++g_framesSent;
+    if (g_streamer->lastFrameSucceeded()) {
+      ++g_framesSent;
+    } else if (g_streamer->consecutiveCaptureFailures() >= 5) {
+      requestCameraRecovery("repeated frame capture failures");
+    }
   }
 
   WiFiClient rtspClient = g_rtspServer.accept();
@@ -862,10 +1127,7 @@ void setupController() {
 
   logBootDiagnostics();
 
-  if (!initCamera()) {
-    Serial.println("[BOOT] Camera init failed, reboot required");
-    return;
-  }
+  if (!initCamera()) Serial.println("[BOOT] Camera init failed, recovery scheduled");
 
   logPsramDiagnostics();
 
@@ -874,18 +1136,23 @@ void setupController() {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.onEvent(onWiFiEvent);
+  enableLoopWDT();
 
   ensureWifi();
-  configureOta();
-  ensureRtspServer();
 }
 
 void loopController() {
-  ArduinoOTA.handle();
+  if (g_otaReady) ArduinoOTA.handle();
+  handleWifiEvents();
   ensureWifi();
-  configureMdns();
+  handleNetworkServices();
+  if (g_otaActive) {
+    delay(1);
+    return;
+  }
   ensureMqtt();
-  ArduinoOTA.handle();
+  if (g_otaReady) ArduinoOTA.handle();
+  handleCameraRecovery();
   handleRtspLoop();
   printRuntimeStats();
   delay(1);

@@ -44,6 +44,13 @@ bool g_mdnsReady = false;
 bool g_timeConfigured = false;
 bool g_streamEnabled = true;
 bool g_networkServicesPending = false;
+bool g_otaReady = false;
+bool g_otaActive = false;
+bool g_mqttEverConnected = false;
+
+volatile bool g_wifiGotIpEvent = false;
+volatile bool g_wifiDisconnectedEvent = false;
+volatile uint8_t g_wifiDisconnectReason = 0;
 
 framesize_t g_frameSize = FRAMESIZE_UXGA;
 int g_jpegQuality = 10;
@@ -55,6 +62,25 @@ int g_hmirror = 0;
 int g_vflip = 1;
 int g_ledEnabled = 0;
 int g_streamFps = dfrcfg::kDefaultRtspFps;
+
+// OV3660 controls exposed by DFRobot's CameraWebServer example.
+int g_gainCeiling = 0;
+int g_colorbar = 0;
+int g_awb = 1;
+int g_agc = 1;
+int g_aec = 1;
+int g_awbGain = 1;
+int g_agcGain = 0;
+int g_aecValue = 300;
+int g_aec2 = 0;
+int g_dcw = 1;
+int g_bpc = 0;
+int g_wpc = 1;
+int g_rawGma = 1;
+int g_lenc = 1;
+int g_specialEffect = 0;
+int g_wbMode = 0;
+int g_aeLevel = 0;
 
 // 0 = off, 1 = on, 2 = automatic from the LTR-308.
 int g_irMode = 2;
@@ -71,7 +97,22 @@ uint32_t g_lastFrameAtMs = 0;
 uint32_t g_lastStatsMs = 0;
 uint32_t g_lastLightReadMs = 0;
 uint32_t g_framesSent = 0;
+uint32_t g_lastCameraHealthCheckMs = 0;
+uint32_t g_lastCameraRecoveryAttemptMs = 0;
+uint32_t g_wifiReconnectCount = 0;
+uint32_t g_mqttReconnectCount = 0;
+uint32_t g_cameraRecoveryCount = 0;
+uint32_t g_mqttPublishFailures = 0;
+uint8_t g_wifiAttemptCount = 0;
+uint8_t g_cameraRecoveryFailures = 0;
+bool g_cameraRecoveryPending = false;
 float g_lastMeasuredFps = 0.0f;
+
+String g_lastCommandId;
+String g_lastCommandName;
+String g_lastCommandResult = "none";
+String g_lastCommandMessage;
+uint32_t g_lastCommandAtMs = 0;
 
 int clampValue(int value, int minimum, int maximum) {
   return camcommon::clampInt(value, minimum, maximum);
@@ -116,6 +157,8 @@ String rtspUrl() {
 }
 
 String streamState() {
+  if (g_otaActive) return "updating";
+  if (g_cameraRecoveryPending) return "recovering";
   if (!g_cameraReady) return "camera_error";
   if (WiFi.status() != WL_CONNECTED) return "wifi_down";
   if (!g_streamEnabled) return "paused";
@@ -150,6 +193,18 @@ void clearError() {
   if (g_lastError.length() == 0) return;
   g_lastError = "";
   publishStatus();
+}
+
+void setCommandResult(
+    const String &command,
+    const String &requestId,
+    const String &result,
+    const String &message) {
+  g_lastCommandName = command;
+  g_lastCommandId = requestId;
+  g_lastCommandResult = result;
+  g_lastCommandMessage = message;
+  g_lastCommandAtMs = millis();
 }
 
 void applyLedState(bool enabled) {
@@ -214,6 +269,7 @@ void rebuildStreamer() {
   esp_camera_fb_return(probe);
 
   g_streamer.reset(new Esp32RtspStreamer(width, height));
+  g_streamer->setNonBlockingTcpWrites(true);
   const String hostPort = WiFi.localIP().toString() + ":" + String(dfrcfg::kRtspPort);
   g_streamer->setURI(hostPort, dfrcfg::kRtspPresentation, dfrcfg::kRtspStream);
   statusf("rtsp ready url=%s", rtspUrl().c_str());
@@ -228,12 +284,15 @@ void ensureRtspServer() {
 
 void publishSimple(const char *suffix, const String &value, bool retain = true) {
   if (g_mqttClient.connected()) {
-    g_mqttClient.publish(mqttTopic(suffix).c_str(), value.c_str(), retain);
+    if (!g_mqttClient.publish(mqttTopic(suffix).c_str(), value.c_str(), retain)) {
+      ++g_mqttPublishFailures;
+    }
   }
 }
 
 String buildConfigJson() {
   String json = "{";
+  json.reserve(768);
   json += "\"framesize\":" + String(frameSizeToIndex(g_frameSize));
   json += ",\"framesize_name\":\"" + String(frameSizeName()) + "\"";
   json += ",\"jpeg_quality\":" + String(g_jpegQuality);
@@ -242,6 +301,23 @@ String buildConfigJson() {
   json += ",\"contrast\":" + String(g_contrast);
   json += ",\"saturation\":" + String(g_saturation);
   json += ",\"sharpness\":" + String(g_sharpness);
+  json += ",\"gainceiling\":" + String(g_gainCeiling);
+  json += ",\"colorbar\":" + String(g_colorbar);
+  json += ",\"awb\":" + String(g_awb);
+  json += ",\"agc\":" + String(g_agc);
+  json += ",\"aec\":" + String(g_aec);
+  json += ",\"awb_gain\":" + String(g_awbGain);
+  json += ",\"agc_gain\":" + String(g_agcGain);
+  json += ",\"aec_value\":" + String(g_aecValue);
+  json += ",\"aec2\":" + String(g_aec2);
+  json += ",\"dcw\":" + String(g_dcw);
+  json += ",\"bpc\":" + String(g_bpc);
+  json += ",\"wpc\":" + String(g_wpc);
+  json += ",\"raw_gma\":" + String(g_rawGma);
+  json += ",\"lenc\":" + String(g_lenc);
+  json += ",\"special_effect\":" + String(g_specialEffect);
+  json += ",\"wb_mode\":" + String(g_wbMode);
+  json += ",\"ae_level\":" + String(g_aeLevel);
   json += ",\"hmirror\":" + String(g_hmirror);
   json += ",\"vflip\":" + String(g_vflip);
   json += ",\"led\":" + String(g_ledEnabled);
@@ -277,6 +353,15 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/direct_sessions", String(directSessionCount()));
   publishSimple("status/direct_streaming_clients", String(directStreamingSessionCount()));
   publishSimple("status/frame_fps", String(g_lastMeasuredFps, 1));
+  publishSimple("status/configured_fps", String(g_streamFps));
+  publishSimple("status/mqtt_connected", "true");
+  publishSimple("status/wifi_rssi", String(WiFi.RSSI()));
+  publishSimple("status/uptime_seconds", String(millis() / 1000UL));
+  publishSimple("status/free_heap_bytes", String(ESP.getFreeHeap()));
+  publishSimple("status/wifi_reconnect_count", String(g_wifiReconnectCount));
+  publishSimple("status/mqtt_reconnect_count", String(g_mqttReconnectCount));
+  publishSimple("status/camera_recovery_count", String(g_cameraRecoveryCount));
+  publishSimple("status/mqtt_publish_failures", String(g_mqttPublishFailures));
   publishSimple("status/ambient_lux", isfinite(g_ambientLux) ? String(g_ambientLux, 2) : "-");
   publishSimple("status/ir_mode", irModeName());
   publishSimple("status/ir_enabled", g_irEnabled ? "true" : "false");
@@ -284,6 +369,11 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/capture_request/state", dfrcapture::state());
   publishSimple("status/capture_request/enabled", dfrcapture::enabled() ? "true" : "false");
   publishSimple("status/capture_request/interval_seconds", String(dfrcapture::intervalSeconds()));
+  publishSimple("status/command/id", g_lastCommandId);
+  publishSimple("status/command/name", g_lastCommandName);
+  publishSimple("status/command/result", g_lastCommandResult);
+  publishSimple("status/command/message", g_lastCommandMessage);
+  publishSimple("status/command/at_ms", String(g_lastCommandAtMs));
 
   const String config = buildConfigJson();
   if (forceConfig || config != previousConfig) {
@@ -300,6 +390,23 @@ void saveControllerSettings() {
   g_preferences.putInt("contrast", g_contrast);
   g_preferences.putInt("saturate", g_saturation);
   g_preferences.putInt("sharp", g_sharpness);
+  g_preferences.putInt("gainceil", g_gainCeiling);
+  g_preferences.putInt("colorbar", g_colorbar);
+  g_preferences.putInt("awb", g_awb);
+  g_preferences.putInt("agc", g_agc);
+  g_preferences.putInt("aec", g_aec);
+  g_preferences.putInt("awbgain", g_awbGain);
+  g_preferences.putInt("agcgain", g_agcGain);
+  g_preferences.putInt("aecvalue", g_aecValue);
+  g_preferences.putInt("aec2", g_aec2);
+  g_preferences.putInt("dcw", g_dcw);
+  g_preferences.putInt("bpc", g_bpc);
+  g_preferences.putInt("wpc", g_wpc);
+  g_preferences.putInt("rawgma", g_rawGma);
+  g_preferences.putInt("lenc", g_lenc);
+  g_preferences.putInt("effect", g_specialEffect);
+  g_preferences.putInt("wbmode", g_wbMode);
+  g_preferences.putInt("aelevel", g_aeLevel);
   g_preferences.putInt("hmirror", g_hmirror);
   g_preferences.putInt("vflip", g_vflip);
   g_preferences.putBool("led", g_ledEnabled != 0);
@@ -310,7 +417,8 @@ void saveControllerSettings() {
 }
 
 void loadControllerSettings() {
-  const bool alignDfrDefaults = g_preferences.getUChar("cfgver", 0) < 2;
+  const uint8_t configVersion = g_preferences.getUChar("cfgver", 0);
+  const bool alignDfrDefaults = configVersion < 2;
   g_frameSize = frameSizeFromIndex(clampValue(g_preferences.getInt("framesize", 6), 0, 7));
   g_jpegQuality = clampValue(g_preferences.getInt("quality", 10), 4, 63);
   g_streamFps = clampValue(g_preferences.getInt("fps", dfrcfg::kDefaultRtspFps), 1, 20);
@@ -318,6 +426,23 @@ void loadControllerSettings() {
   g_contrast = clampValue(g_preferences.getInt("contrast", 0), -2, 2);
   g_saturation = clampValue(g_preferences.getInt("saturate", -2), -2, 2);
   g_sharpness = clampValue(g_preferences.getInt("sharp", 0), -2, 2);
+  g_gainCeiling = clampValue(g_preferences.getInt("gainceil", 0), 0, 6);
+  g_colorbar = g_preferences.getInt("colorbar", 0) ? 1 : 0;
+  g_awb = g_preferences.getInt("awb", 1) ? 1 : 0;
+  g_agc = g_preferences.getInt("agc", 1) ? 1 : 0;
+  g_aec = g_preferences.getInt("aec", 1) ? 1 : 0;
+  g_awbGain = g_preferences.getInt("awbgain", 1) ? 1 : 0;
+  g_agcGain = clampValue(g_preferences.getInt("agcgain", 0), 0, 30);
+  g_aecValue = clampValue(g_preferences.getInt("aecvalue", 300), 0, 1200);
+  g_aec2 = g_preferences.getInt("aec2", 0) ? 1 : 0;
+  g_dcw = g_preferences.getInt("dcw", 1) ? 1 : 0;
+  g_bpc = g_preferences.getInt("bpc", 0) ? 1 : 0;
+  g_wpc = g_preferences.getInt("wpc", 1) ? 1 : 0;
+  g_rawGma = g_preferences.getInt("rawgma", 1) ? 1 : 0;
+  g_lenc = g_preferences.getInt("lenc", 1) ? 1 : 0;
+  g_specialEffect = clampValue(g_preferences.getInt("effect", 0), 0, 6);
+  g_wbMode = clampValue(g_preferences.getInt("wbmode", 0), 0, 4);
+  g_aeLevel = clampValue(g_preferences.getInt("aelevel", 0), -2, 2);
   g_hmirror = g_preferences.getInt("hmirror", 0) ? 1 : 0;
   g_vflip = g_preferences.getInt("vflip", 1) ? 1 : 0;
   g_ledEnabled = g_preferences.getBool("led", false) ? 1 : 0;
@@ -337,7 +462,10 @@ void loadControllerSettings() {
     g_sharpness = 0;
     g_vflip = 1;
     saveControllerSettings();
-    g_preferences.putUChar("cfgver", 2);
+  }
+  if (configVersion < 3) {
+    saveControllerSettings();
+    g_preferences.putUChar("cfgver", 3);
   }
 }
 
@@ -347,46 +475,52 @@ bool applySensorSettings(bool rebuildAfter) {
     setError("camera sensor unavailable");
     return false;
   }
-  if (sensor->set_framesize(sensor, g_frameSize) != 0) {
-    setError("camera framesize apply failed");
-    return false;
-  }
-  if (sensor->set_quality(sensor, g_jpegQuality) != 0) {
-    setError("camera quality apply failed");
-    return false;
-  }
-  if (sensor->set_brightness(sensor, g_brightness) != 0) {
-    setError("camera brightness apply failed");
-    return false;
-  }
-  if (sensor->set_contrast(sensor, g_contrast) != 0) {
-    setError("camera contrast apply failed");
-    return false;
-  }
-  if (sensor->set_saturation(sensor, g_saturation) != 0) {
-    setError("camera saturation apply failed");
-    return false;
-  }
-  if (sensor->set_sharpness(sensor, g_sharpness) != 0) {
-    setError("camera sharpness apply failed");
-    return false;
-  }
-  if (sensor->set_hmirror(sensor, g_hmirror) != 0) {
-    setError("camera hmirror apply failed");
-    return false;
-  }
-  if (sensor->set_vflip(sensor, g_vflip) != 0) {
-    setError("camera vflip apply failed");
-    return false;
-  }
+  bool success = true;
+  String failedSetting;
+  const auto check = [&](int result, const char *name) {
+    if (result == 0) return;
+    success = false;
+    if (failedSetting.length() == 0) failedSetting = name;
+  };
+
+  check(sensor->set_framesize(sensor, g_frameSize), "framesize");
+  check(sensor->set_quality(sensor, g_jpegQuality), "jpeg_quality");
+  check(sensor->set_brightness(sensor, g_brightness), "brightness");
+  check(sensor->set_contrast(sensor, g_contrast), "contrast");
+  check(sensor->set_saturation(sensor, g_saturation), "saturation");
+  check(sensor->set_sharpness(sensor, g_sharpness), "sharpness");
+  check(sensor->set_gainceiling(sensor, static_cast<gainceiling_t>(g_gainCeiling)), "gainceiling");
+  check(sensor->set_colorbar(sensor, g_colorbar), "colorbar");
+  check(sensor->set_whitebal(sensor, g_awb), "awb");
+  check(sensor->set_gain_ctrl(sensor, g_agc), "agc");
+  check(sensor->set_exposure_ctrl(sensor, g_aec), "aec");
+  check(sensor->set_awb_gain(sensor, g_awbGain), "awb_gain");
+  check(sensor->set_agc_gain(sensor, g_agcGain), "agc_gain");
+  check(sensor->set_aec_value(sensor, g_aecValue), "aec_value");
+  check(sensor->set_aec2(sensor, g_aec2), "aec2");
+  check(sensor->set_dcw(sensor, g_dcw), "dcw");
+  check(sensor->set_bpc(sensor, g_bpc), "bpc");
+  check(sensor->set_wpc(sensor, g_wpc), "wpc");
+  check(sensor->set_raw_gma(sensor, g_rawGma), "raw_gma");
+  check(sensor->set_lenc(sensor, g_lenc), "lenc");
+  check(sensor->set_special_effect(sensor, g_specialEffect), "special_effect");
+  check(sensor->set_wb_mode(sensor, g_wbMode), "wb_mode");
+  check(sensor->set_ae_level(sensor, g_aeLevel), "ae_level");
+  check(sensor->set_hmirror(sensor, g_hmirror), "hmirror");
+  check(sensor->set_vflip(sensor, g_vflip), "vflip");
   applyLedState(g_ledEnabled != 0);
   evaluateIrAutomation();
   if (rebuildAfter) rebuildStreamer();
+  if (!success) {
+    setError("camera setting apply failed: " + failedSetting);
+    return false;
+  }
   clearError();
   return true;
 }
 
 bool initCamera() {
+  g_cameraReady = false;
   g_psramReady = psramFound();
   if (!g_psramReady) {
     setError("DFR1154 PSRAM not detected");
@@ -428,6 +562,8 @@ bool initCamera() {
 
   g_cameraReady = true;
   applySensorSettings(false);
+  g_cameraRecoveryFailures = 0;
+  g_cameraRecoveryPending = false;
   statusf("camera ready sensor=OV3660 psram=%luMB frame=%s", ESP.getPsramSize() / (1024UL * 1024UL), frameSizeName());
   return true;
 }
@@ -452,6 +588,50 @@ bool restartCameraPipeline() {
   return true;
 }
 
+void requestCameraRecovery(const String &reason) {
+  if (!g_cameraRecoveryPending) {
+    statusf("camera recovery requested: %s", reason.c_str());
+  }
+  g_cameraRecoveryPending = true;
+}
+
+void handleCameraRecovery() {
+  const uint32_t now = millis();
+
+  if (g_cameraReady && !g_cameraRecoveryPending) {
+    if (!g_streamEnabled || directStreamingSessionCount() > 0 ||
+        now - g_lastCameraHealthCheckMs < 30000UL) {
+      return;
+    }
+    g_lastCameraHealthCheckMs = now;
+    camera_fb_t *frame = esp_camera_fb_get();
+    if (frame != nullptr) {
+      esp_camera_fb_return(frame);
+      return;
+    }
+    requestCameraRecovery("health probe failed");
+  }
+
+  if (g_cameraReady && !g_cameraRecoveryPending) return;
+  if (now - g_lastCameraRecoveryAttemptMs < 10000UL) return;
+  g_lastCameraRecoveryAttemptMs = now;
+  ++g_cameraRecoveryCount;
+
+  if (restartCameraPipeline()) {
+    g_cameraRecoveryFailures = 0;
+    g_cameraRecoveryPending = false;
+    statusf("camera recovery successful count=%lu", g_cameraRecoveryCount);
+    return;
+  }
+
+  ++g_cameraRecoveryFailures;
+  if (g_cameraRecoveryFailures >= 3) {
+    statusf("camera recovery failed %u times; rebooting", g_cameraRecoveryFailures);
+    delay(100);
+    ESP.restart();
+  }
+}
+
 void configureLightSensor() {
   // DFRobot requires camera initialization before starting the shared SCCB/I2C bus.
   g_lightReady = false;
@@ -473,14 +653,25 @@ void configureLightSensor() {
 }
 
 void configureOta() {
+  if (g_otaReady || WiFi.status() != WL_CONNECTED) return;
   ArduinoOTA.setHostname(dfrcfg::kOtaHostname);
   if (strlen(dfrcfg::kOtaPassword) > 0) ArduinoOTA.setPassword(dfrcfg::kOtaPassword);
-  ArduinoOTA.onStart([]() { recordStatus("ota update started"); });
+  ArduinoOTA.setMdnsEnabled(false);
+  ArduinoOTA.onStart([]() {
+    g_otaActive = true;
+    g_streamer.reset();
+    recordStatus("ota update started; camera stream suspended");
+    publishStatus();
+  });
   ArduinoOTA.onEnd([]() { recordStatus("ota update finished"); });
+  ArduinoOTA.onProgress([](unsigned int, unsigned int) { feedLoopWDT(); });
   ArduinoOTA.onError([](ota_error_t error) {
+    g_otaActive = false;
     setError("ota error=" + String(static_cast<uint32_t>(error)));
+    rebuildStreamer();
   });
   ArduinoOTA.begin();
+  g_otaReady = true;
   statusf("ota ready host=%s", dfrcfg::kOtaHostname);
 }
 
@@ -490,6 +681,7 @@ void configureMdns() {
     recordStatus("mdns setup failed");
     return;
   }
+  MDNS.addService("arduino", "tcp", 3232);
   MDNS.addService("rtsp", "tcp", dfrcfg::kRtspPort);
   g_mdnsReady = true;
 }
@@ -497,24 +689,51 @@ void configureMdns() {
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      statusf("wifi ip=%s", WiFi.localIP().toString().c_str());
-      if (!g_timeConfigured) {
-        configTzTime(dfrcfg::kTimezone, dfrcfg::kNtpServer1, dfrcfg::kNtpServer2);
-        g_timeConfigured = true;
-      }
-      g_networkServicesPending = true;
+      g_wifiGotIpEvent = true;
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      statusf("wifi disconnected reason=%d", info.wifi_sta_disconnected.reason);
-      g_mqttClient.disconnect();
-      g_lastMqttAttemptMs = 0;
-      g_streamer.reset();
-      MDNS.end();
-      g_mdnsReady = false;
-      g_networkServicesPending = false;
+      g_wifiDisconnectReason = info.wifi_sta_disconnected.reason;
+      g_wifiDisconnectedEvent = true;
       break;
     default:
       break;
+  }
+}
+
+void handleWifiEvents() {
+  if (g_wifiDisconnectedEvent) {
+    g_wifiDisconnectedEvent = false;
+    ++g_wifiReconnectCount;
+    g_lastWifiAttemptMs = 0;
+    g_otaActive = false;
+    g_streamer.reset();
+    g_rtspServer.end();
+    g_rtspServerStarted = false;
+    if (g_mqttClient.connected()) g_mqttClient.disconnect();
+    g_mqttSocket.stop();
+    g_lastMqttAttemptMs = 0;
+    if (g_otaReady) {
+      ArduinoOTA.end();
+      g_otaReady = false;
+    }
+    if (g_mdnsReady) {
+      MDNS.end();
+      g_mdnsReady = false;
+    }
+    g_networkServicesPending = false;
+    statusf("wifi disconnected reason=%u", g_wifiDisconnectReason);
+  }
+
+  if (g_wifiGotIpEvent) {
+    g_wifiGotIpEvent = false;
+    g_wifiAttemptCount = 0;
+    g_lastWifiAttemptMs = 0;
+    statusf("wifi ip=%s", WiFi.localIP().toString().c_str());
+    if (!g_timeConfigured) {
+      configTzTime(dfrcfg::kTimezone, dfrcfg::kNtpServer1, dfrcfg::kNtpServer2);
+      g_timeConfigured = true;
+    }
+    g_networkServicesPending = true;
   }
 }
 
@@ -522,6 +741,7 @@ void handleNetworkServices() {
   if (!g_networkServicesPending || WiFi.status() != WL_CONNECTED) return;
   g_networkServicesPending = false;
   configureMdns();
+  configureOta();
   ensureRtspServer();
   rebuildStreamer();
 }
@@ -529,12 +749,18 @@ void handleNetworkServices() {
 void ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) return;
   const uint32_t now = millis();
-  if (now - g_lastWifiAttemptMs < dfrcfg::kWifiRetryMs) return;
+  if (g_lastWifiAttemptMs != 0 && now - g_lastWifiAttemptMs < dfrcfg::kWifiRetryMs) return;
   g_lastWifiAttemptMs = now;
+  ++g_wifiAttemptCount;
 
   if (!g_wifiStarted) {
     g_wifiStarted = true;
     statusf("wifi connecting ssid=%s", dfrcfg::kWifiSsid);
+    WiFi.begin(dfrcfg::kWifiSsid, dfrcfg::kWifiPassword);
+  } else if (g_wifiAttemptCount % 6 == 0) {
+    recordStatus("wifi stack reconnect");
+    WiFi.disconnect(false, false);
+    delay(20);
     WiFi.begin(dfrcfg::kWifiSsid, dfrcfg::kWifiPassword);
   } else {
     WiFi.reconnect();
@@ -549,124 +775,238 @@ bool extractPayloadInt(const String &payload, const char *key, int &value) {
   return camcommon::extractPayloadInt(payload, key, value);
 }
 
-bool applySetting(const char *key, int value, bool &streamRebuildRequired, bool &cameraRestartRequired) {
+enum class SettingResult { unsupported, unchanged, applied, failed };
+
+SettingResult applySetting(const char *key, int value, bool &streamRebuildRequired) {
+  sensor_t *sensor = esp_camera_sensor_get();
+  const auto requireSensor = [&]() {
+    if (sensor != nullptr) return true;
+    requestCameraRecovery("sensor unavailable while applying settings");
+    return false;
+  };
+
   if (strcmp(key, "framesize") == 0) {
     const framesize_t bounded = frameSizeFromIndex(clampValue(value, 0, 7));
-    if (bounded == g_frameSize) return false;
+    if (bounded == g_frameSize) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_framesize(sensor, bounded) != 0) return SettingResult::failed;
     g_frameSize = bounded;
-    cameraRestartRequired = true;
+    streamRebuildRequired = true;
   } else if (strcmp(key, "jpeg_quality") == 0) {
     const int bounded = clampValue(value, 4, 63);
-    if (bounded == g_jpegQuality) return false;
+    if (bounded == g_jpegQuality) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_quality(sensor, bounded) != 0) return SettingResult::failed;
     g_jpegQuality = bounded;
-    cameraRestartRequired = true;
   } else if (strcmp(key, "stream_fps") == 0) {
     const int bounded = clampValue(value, 1, 20);
-    if (bounded == g_streamFps) return false;
+    if (bounded == g_streamFps) return SettingResult::unchanged;
     g_streamFps = bounded;
   } else if (strcmp(key, "brightness") == 0) {
     const int bounded = clampValue(value, -2, 2);
-    if (bounded == g_brightness) return false;
+    if (bounded == g_brightness) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_brightness(sensor, bounded) != 0) return SettingResult::failed;
     g_brightness = bounded;
-    cameraRestartRequired = true;
   } else if (strcmp(key, "contrast") == 0) {
     const int bounded = clampValue(value, -2, 2);
-    if (bounded == g_contrast) return false;
+    if (bounded == g_contrast) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_contrast(sensor, bounded) != 0) return SettingResult::failed;
     g_contrast = bounded;
-    cameraRestartRequired = true;
   } else if (strcmp(key, "saturation") == 0) {
     const int bounded = clampValue(value, -2, 2);
-    if (bounded == g_saturation) return false;
+    if (bounded == g_saturation) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_saturation(sensor, bounded) != 0) return SettingResult::failed;
     g_saturation = bounded;
-    cameraRestartRequired = true;
   } else if (strcmp(key, "sharpness") == 0) {
     const int bounded = clampValue(value, -2, 2);
-    if (bounded == g_sharpness) return false;
+    if (bounded == g_sharpness) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_sharpness(sensor, bounded) != 0) return SettingResult::failed;
     g_sharpness = bounded;
-    cameraRestartRequired = true;
+  } else if (strcmp(key, "gainceiling") == 0) {
+    const int bounded = clampValue(value, 0, 6);
+    if (bounded == g_gainCeiling) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_gainceiling(sensor, static_cast<gainceiling_t>(bounded)) != 0) return SettingResult::failed;
+    g_gainCeiling = bounded;
+  } else if (strcmp(key, "colorbar") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_colorbar) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_colorbar(sensor, bounded) != 0) return SettingResult::failed;
+    g_colorbar = bounded;
+  } else if (strcmp(key, "awb") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_awb) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_whitebal(sensor, bounded) != 0) return SettingResult::failed;
+    g_awb = bounded;
+  } else if (strcmp(key, "agc") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_agc) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_gain_ctrl(sensor, bounded) != 0) return SettingResult::failed;
+    g_agc = bounded;
+  } else if (strcmp(key, "aec") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_aec) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_exposure_ctrl(sensor, bounded) != 0) return SettingResult::failed;
+    g_aec = bounded;
+  } else if (strcmp(key, "awb_gain") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_awbGain) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_awb_gain(sensor, bounded) != 0) return SettingResult::failed;
+    g_awbGain = bounded;
+  } else if (strcmp(key, "agc_gain") == 0) {
+    const int bounded = clampValue(value, 0, 30);
+    if (bounded == g_agcGain) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_agc_gain(sensor, bounded) != 0) return SettingResult::failed;
+    g_agcGain = bounded;
+  } else if (strcmp(key, "aec_value") == 0) {
+    const int bounded = clampValue(value, 0, 1200);
+    if (bounded == g_aecValue) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_aec_value(sensor, bounded) != 0) return SettingResult::failed;
+    g_aecValue = bounded;
+  } else if (strcmp(key, "aec2") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_aec2) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_aec2(sensor, bounded) != 0) return SettingResult::failed;
+    g_aec2 = bounded;
+  } else if (strcmp(key, "dcw") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_dcw) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_dcw(sensor, bounded) != 0) return SettingResult::failed;
+    g_dcw = bounded;
+  } else if (strcmp(key, "bpc") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_bpc) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_bpc(sensor, bounded) != 0) return SettingResult::failed;
+    g_bpc = bounded;
+  } else if (strcmp(key, "wpc") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_wpc) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_wpc(sensor, bounded) != 0) return SettingResult::failed;
+    g_wpc = bounded;
+  } else if (strcmp(key, "raw_gma") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_rawGma) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_raw_gma(sensor, bounded) != 0) return SettingResult::failed;
+    g_rawGma = bounded;
+  } else if (strcmp(key, "lenc") == 0) {
+    const int bounded = value ? 1 : 0;
+    if (bounded == g_lenc) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_lenc(sensor, bounded) != 0) return SettingResult::failed;
+    g_lenc = bounded;
+  } else if (strcmp(key, "special_effect") == 0) {
+    const int bounded = clampValue(value, 0, 6);
+    if (bounded == g_specialEffect) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_special_effect(sensor, bounded) != 0) return SettingResult::failed;
+    g_specialEffect = bounded;
+  } else if (strcmp(key, "wb_mode") == 0) {
+    const int bounded = clampValue(value, 0, 4);
+    if (bounded == g_wbMode) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_wb_mode(sensor, bounded) != 0) return SettingResult::failed;
+    g_wbMode = bounded;
+  } else if (strcmp(key, "ae_level") == 0) {
+    const int bounded = clampValue(value, -2, 2);
+    if (bounded == g_aeLevel) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_ae_level(sensor, bounded) != 0) return SettingResult::failed;
+    g_aeLevel = bounded;
   } else if (strcmp(key, "hmirror") == 0) {
     const int bounded = value ? 1 : 0;
-    if (bounded == g_hmirror) return false;
+    if (bounded == g_hmirror) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_hmirror(sensor, bounded) != 0) return SettingResult::failed;
     g_hmirror = bounded;
-    cameraRestartRequired = true;
   } else if (strcmp(key, "vflip") == 0) {
     const int bounded = value ? 1 : 0;
-    if (bounded == g_vflip) return false;
+    if (bounded == g_vflip) return SettingResult::unchanged;
+    if (!requireSensor() || sensor->set_vflip(sensor, bounded) != 0) return SettingResult::failed;
     g_vflip = bounded;
-    cameraRestartRequired = true;
   } else if (strcmp(key, "led") == 0) {
     const int bounded = value ? 1 : 0;
-    if (bounded == g_ledEnabled) return false;
+    if (bounded == g_ledEnabled) return SettingResult::unchanged;
     applyLedState(bounded != 0);
   } else if (strcmp(key, "stream_enabled") == 0) {
     const bool enabled = value != 0;
-    if (enabled == g_streamEnabled) return false;
+    if (enabled == g_streamEnabled) return SettingResult::unchanged;
     g_streamEnabled = enabled;
     streamRebuildRequired = true;
   } else if (strcmp(key, "ir_mode") == 0) {
     const int bounded = clampValue(value, 0, 2);
-    if (bounded == g_irMode) return false;
+    if (bounded == g_irMode) return SettingResult::unchanged;
     g_irMode = bounded;
     evaluateIrAutomation();
   } else if (strcmp(key, "ir_on_lux") == 0) {
     const float bounded = static_cast<float>(clampValue(value, 0, 100000));
-    if (fabsf(bounded - g_irOnBelowLux) < 0.01f) return false;
+    if (fabsf(bounded - g_irOnBelowLux) < 0.01f) return SettingResult::unchanged;
     g_irOnBelowLux = bounded;
     if (g_irOffAboveLux <= g_irOnBelowLux) g_irOffAboveLux = g_irOnBelowLux + 2.0f;
     evaluateIrAutomation();
   } else if (strcmp(key, "ir_off_lux") == 0) {
     const float bounded = static_cast<float>(clampValue(value, 1, 100000));
-    if (fabsf(bounded - g_irOffAboveLux) < 0.01f) return false;
+    if (fabsf(bounded - g_irOffAboveLux) < 0.01f) return SettingResult::unchanged;
     g_irOffAboveLux = bounded;
     if (g_irOffAboveLux <= g_irOnBelowLux) g_irOnBelowLux = max(0.0f, g_irOffAboveLux - 2.0f);
     evaluateIrAutomation();
   } else if (strcmp(key, "timelapse_enabled") == 0 || strcmp(key, "server_capture_enabled") == 0) {
     const bool enabled = value != 0;
-    if (enabled == dfrcapture::enabled()) return false;
+    if (enabled == dfrcapture::enabled()) return SettingResult::unchanged;
     dfrcapture::setEnabled(enabled);
   } else if (strcmp(key, "timelapse_interval_seconds") == 0 || strcmp(key, "server_capture_interval_seconds") == 0) {
     const uint32_t bounded = static_cast<uint32_t>(max(5, value));
-    if (bounded == dfrcapture::intervalSeconds()) return false;
+    if (bounded == dfrcapture::intervalSeconds()) return SettingResult::unchanged;
     dfrcapture::setIntervalSeconds(bounded);
   } else {
-    return false;
+    return SettingResult::unsupported;
   }
-  return true;
+  return SettingResult::applied;
 }
 
 void applyControlPayload(const String &payload) {
   static const char *keys[] = {
       "framesize", "jpeg_quality", "stream_fps", "brightness", "contrast", "saturation",
-      "sharpness", "hmirror", "vflip", "led", "stream_enabled", "ir_mode", "ir_on_lux",
-      "ir_off_lux", "server_capture_enabled", "server_capture_interval_seconds",
-      "timelapse_enabled", "timelapse_interval_seconds"};
+      "sharpness", "gainceiling", "colorbar", "awb", "agc", "aec", "awb_gain",
+      "agc_gain", "aec_value", "aec2", "dcw", "bpc", "wpc", "raw_gma", "lenc",
+      "special_effect", "wb_mode", "ae_level", "hmirror", "vflip", "led",
+      "stream_enabled", "ir_mode", "ir_on_lux", "ir_off_lux", "server_capture_enabled",
+      "server_capture_interval_seconds", "timelapse_enabled", "timelapse_interval_seconds"};
 
+  String requestId;
+  extractPayloadToken(payload, "_request_id", requestId);
+  bool recognized = false;
   bool changed = false;
+  bool failed = false;
   bool streamRebuildRequired = false;
-  bool cameraRestartRequired = false;
+  String failedSetting;
   for (const char *key : keys) {
     int value = 0;
-    if (extractPayloadInt(payload, key, value) &&
-        applySetting(key, value, streamRebuildRequired, cameraRestartRequired)) {
-      changed = true;
+    if (!extractPayloadInt(payload, key, value)) continue;
+    const SettingResult result = applySetting(key, value, streamRebuildRequired);
+    if (result != SettingResult::unsupported) recognized = true;
+    if (result == SettingResult::applied) changed = true;
+    if (result == SettingResult::failed) {
+      failed = true;
+      if (failedSetting.length() == 0) failedSetting = key;
     }
   }
 
-  if (!changed) {
+  if (!recognized) {
+    setCommandResult("set", requestId, "error", "no supported setting in payload");
     setError("no supported setting in MQTT payload");
+    publishStatus(true);
     return;
   }
-  saveControllerSettings();
-  if (cameraRestartRequired) {
-    if (!restartCameraPipeline()) return;
-  } else if (streamRebuildRequired) {
-    rebuildStreamer();
+
+  if (changed) saveControllerSettings();
+  if (streamRebuildRequired) rebuildStreamer();
+  if (failed) {
+    const String message = "setting apply failed: " + failedSetting;
+    setCommandResult("set", requestId, changed ? "partial" : "error", message);
+    setError(message);
+  } else {
+    clearError();
+    setCommandResult("set", requestId, "ok", changed ? "settings applied" : "settings already active");
+    statusf("camera control applied live frame=%s q=%d fps=%d", frameSizeName(), g_jpegQuality, g_streamFps);
   }
-  clearError();
   publishStatus(true);
 }
 
 void applyTimelapsePayload(const String &payload) {
+  String requestId;
+  extractPayloadToken(payload, "_request_id", requestId);
   int value = 0;
   bool changed = false;
   if (extractPayloadInt(payload, "enabled", value)) {
@@ -677,7 +1017,13 @@ void applyTimelapsePayload(const String &payload) {
     dfrcapture::setIntervalSeconds(static_cast<uint32_t>(max(5, value)));
     changed = true;
   }
-  if (!changed) setError("no supported timelapse setting in MQTT payload");
+  if (!changed) {
+    setCommandResult("capture_set", requestId, "error", "no supported capture setting in payload");
+    setError("no supported server capture setting in MQTT payload");
+  } else {
+    clearError();
+    setCommandResult("capture_set", requestId, "ok", "server capture settings applied");
+  }
   publishStatus(true);
 }
 
@@ -687,27 +1033,44 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   payloadText.reserve(length + 1);
   for (unsigned int index = 0; index < length; ++index) payloadText += static_cast<char>(payload[index]);
   Serial.printf("[MQTT] %s: %s\n", topicText.c_str(), payloadText.c_str());
+  String requestId;
+  extractPayloadToken(payloadText, "_request_id", requestId);
 
   if (topicText == mqttTopic("cmd/start")) {
     g_streamEnabled = true;
     saveControllerSettings();
     rebuildStreamer();
+    clearError();
+    setCommandResult("start", requestId, "ok", "stream enabled");
+    recordStatus("mqtt start command");
   } else if (topicText == mqttTopic("cmd/stop")) {
     g_streamEnabled = false;
     saveControllerSettings();
     g_streamer.reset();
+    setCommandResult("stop", requestId, "ok", "stream disabled");
+    recordStatus("mqtt stop command");
   } else if (topicText == mqttTopic("cmd/restart")) {
+    setCommandResult("restart", requestId, "ok", "device rebooting");
     publishSimple("status/state", "restarting");
+    publishStatus(true);
+    g_mqttClient.loop();
     delay(100);
     ESP.restart();
   } else if (topicText == mqttTopic("cmd/ping")) {
-    publishSimple("status/pong", payloadText.length() > 0 ? payloadText : "pong");
+    publishSimple("status/pong", requestId.length() > 0 ? requestId : (payloadText.length() > 0 ? payloadText : "pong"));
+    setCommandResult("ping", requestId, "ok", "pong");
   } else if (topicText == mqttTopic("cmd/set")) {
     applyControlPayload(payloadText);
   } else if (topicText == mqttTopic("cmd/timelapse/start")) {
-    if (!dfrcapture::setEnabled(true)) setError("unable to start timelapse");
+    if (!dfrcapture::setEnabled(true)) {
+      setError("unable to start server capture");
+      setCommandResult("capture_start", requestId, "error", g_lastError);
+    } else {
+      setCommandResult("capture_start", requestId, "ok", "server capture requested");
+    }
   } else if (topicText == mqttTopic("cmd/timelapse/stop")) {
     dfrcapture::setEnabled(false);
+    setCommandResult("capture_stop", requestId, "ok", "server capture disabled");
   } else if (topicText == mqttTopic("cmd/timelapse/set")) {
     applyTimelapsePayload(payloadText);
   }
@@ -726,7 +1089,8 @@ void ensureMqtt() {
   g_mqttClient.setServer(dfrcfg::kMqttHost, dfrcfg::kMqttPort);
   g_mqttClient.setCallback(mqttCallback);
   g_mqttClient.setSocketTimeout(1);
-  g_mqttClient.setBufferSize(1024);
+  g_mqttClient.setKeepAlive(20);
+  g_mqttClient.setBufferSize(2048);
   const String willTopic = mqttTopic("status/online");
   bool connected = false;
   if (strlen(dfrcfg::kMqttUsername) > 0) {
@@ -742,18 +1106,22 @@ void ensureMqtt() {
     connected = g_mqttClient.connect(dfrcfg::kMqttClientId, willTopic.c_str(), 1, true, "false");
   }
   if (!connected) {
+    g_mqttSocket.stop();
     statusf("mqtt connect failed rc=%d", g_mqttClient.state());
     return;
   }
 
-  g_mqttClient.subscribe(mqttTopic("cmd/start").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/stop").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/restart").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/ping").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/set").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/timelapse/start").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/timelapse/stop").c_str());
-  g_mqttClient.subscribe(mqttTopic("cmd/timelapse/set").c_str());
+  if (g_mqttEverConnected) ++g_mqttReconnectCount;
+  g_mqttEverConnected = true;
+
+  g_mqttClient.subscribe(mqttTopic("cmd/start").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/stop").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/restart").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/ping").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/set").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/timelapse/start").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/timelapse/stop").c_str(), 1);
+  g_mqttClient.subscribe(mqttTopic("cmd/timelapse/set").c_str(), 1);
   statusf("mqtt connected topic=%s", dfrcfg::kMqttBaseTopic);
   publishStatus(true);
 }
@@ -775,7 +1143,11 @@ void handleRtspLoop() {
       (now - g_lastFrameAtMs >= frameIntervalMs || now < g_lastFrameAtMs)) {
     g_streamer->streamImage(now);
     g_lastFrameAtMs = now;
-    ++g_framesSent;
+    if (g_streamer->lastFrameSucceeded()) {
+      ++g_framesSent;
+    } else if (g_streamer->consecutiveCaptureFailures() >= 5) {
+      requestCameraRecovery("repeated frame capture failures");
+    }
   }
 
   WiFiClient client = g_rtspServer.accept();
@@ -834,21 +1206,26 @@ void setupController() {
       ESP.getFreeHeap() / 1024UL);
 
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.onEvent(onWifiEvent);
+  enableLoopWDT();
   ensureWifi();
-  configureOta();
-  ensureRtspServer();
 }
 
 void loopController() {
-  ArduinoOTA.handle();
+  if (g_otaReady) ArduinoOTA.handle();
+  handleWifiEvents();
   ensureWifi();
   handleNetworkServices();
-  configureMdns();
+  if (g_otaActive) {
+    delay(1);
+    return;
+  }
   ensureMqtt();
-  ArduinoOTA.handle();
+  if (g_otaReady) ArduinoOTA.handle();
+  handleCameraRecovery();
   handleLightSensor();
   handleRtspLoop();
   updateRuntimeStats();
