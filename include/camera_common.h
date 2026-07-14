@@ -8,7 +8,7 @@
 
 namespace camcommon {
 
-constexpr char kFirmwareVersion[] = "2026.07.14-rtsp4";
+constexpr char kFirmwareVersion[] = "2026.07.14-settings3";
 
 inline int clampInt(int value, int minimum, int maximum) {
   return value < minimum ? minimum : (value > maximum ? maximum : value);

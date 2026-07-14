@@ -249,7 +249,9 @@ void rebuildStreamer() {
   esp_camera_fb_return(probe);
 
   g_streamer.reset(new Esp32RtspStreamer(width, height));
-  g_streamer->setNonBlockingTcpWrites(true);
+  // The original blocking Micro-RTSP writer is required to keep complete
+  // interleaved RTP packets intact when the WiFi send buffer is briefly full.
+  g_streamer->setNonBlockingTcpWrites(false);
   String hostPort = WiFi.localIP().toString();
   hostPort += ":";
   hostPort += String(appcfg::kRtspPort);

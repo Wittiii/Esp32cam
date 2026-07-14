@@ -22,6 +22,7 @@ CStreamer::CStreamer(u_short width, u_short height) : m_Clients()
 
     m_udpRefCount = 0;
     m_nonBlockingTcpWrites = false;
+    m_serviceCallback = NULL;
 
     debug = false;
 
@@ -203,6 +204,8 @@ int CStreamer::SendRtpPacket(unsigned const char * jpeg, int jpegLen, int fragme
         }
         element = element->m_Next;
     }
+    if (m_serviceCallback != NULL)
+        m_serviceCallback();
     // if ( debug ) printf("CStreamer::SendRtpPacket offset:%d - end\n", fragmentOffset);
     return isLastFragment ? 0 : fragmentOffset;
 };

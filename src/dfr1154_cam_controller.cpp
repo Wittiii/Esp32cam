@@ -113,6 +113,9 @@ String g_lastCommandName;
 String g_lastCommandResult = "none";
 String g_lastCommandMessage;
 uint32_t g_lastCommandAtMs = 0;
+String g_pendingMqttTopic;
+String g_pendingMqttPayload;
+bool g_pendingMqttMessage = false;
 
 int clampValue(int value, int minimum, int maximum) {
   return camcommon::clampInt(value, minimum, maximum);
@@ -167,6 +170,12 @@ String streamState() {
 
 void publishStatus(bool forceConfig = false);
 void configureLightSensor();
+
+void serviceMqttDuringRtspWrite() {
+  if (g_mqttClient.connected()) g_mqttClient.loop();
+  feedLoopWDT();
+  delay(0);
+}
 
 void recordStatus(const String &message) {
   g_lastStatus = message;
@@ -269,7 +278,9 @@ void rebuildStreamer() {
   esp_camera_fb_return(probe);
 
   g_streamer.reset(new Esp32RtspStreamer(width, height));
-  g_streamer->setNonBlockingTcpWrites(true);
+  // Match the proven Micro-RTSP transport used before the reconnect changes.
+  g_streamer->setNonBlockingTcpWrites(false);
+  g_streamer->setServiceCallback(serviceMqttDuringRtspWrite);
   const String hostPort = WiFi.localIP().toString() + ":" + String(dfrcfg::kRtspPort);
   g_streamer->setURI(hostPort, dfrcfg::kRtspPresentation, dfrcfg::kRtspStream);
   statusf("rtsp ready url=%s", rtspUrl().c_str());
@@ -543,8 +554,11 @@ bool initCamera() {
   config.pin_pclk = DFR_CAM_PCLK;
   config.pin_vsync = DFR_CAM_VSYNC;
   config.pin_href = DFR_CAM_HREF;
-  config.pin_sccb_sda = DFR_CAM_SIOD;
-  config.pin_sccb_scl = DFR_CAM_SIOC;
+  // Camera and LTR-308 share I2C0. Using the already configured bus prevents
+  // the light sensor from invalidating the camera driver's SCCB handle.
+  config.pin_sccb_sda = -1;
+  config.pin_sccb_scl = -1;
+  config.sccb_i2c_port = 0;
   config.pin_pwdn = DFR_CAM_PWDN;
   config.pin_reset = DFR_CAM_RESET;
   config.xclk_freq_hz = 20000000;
@@ -634,13 +648,12 @@ void handleCameraRecovery() {
 }
 
 void configureLightSensor() {
-  // DFRobot requires camera initialization before starting the shared SCCB/I2C bus.
   g_lightReady = false;
   g_ambientLux = NAN;
-  Wire.end();
-  delay(5);
-  Wire.begin(DFR_CAM_SIOD, DFR_CAM_SIOC);
   g_lightReady = g_lightSensor.begin();
+  // DFRobot_LTR308::begin() selects 400 kHz. OV3660 SCCB register writes are
+  // more reliable at the camera driver's normal 100 kHz bus speed.
+  Wire.setClock(100000);
   if (!g_lightReady) {
     recordStatus("LTR-308 light sensor unavailable; IR auto mode suspended");
     return;
@@ -778,6 +791,25 @@ bool extractPayloadInt(const String &payload, const char *key, int &value) {
 
 enum class SettingResult { unsupported, unchanged, applied, failed };
 
+template <typename Value>
+bool applySensorControl(
+    sensor_t *sensor,
+    int (*setter)(sensor_t *, Value),
+    Value value,
+    const char *key) {
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (setter(sensor, value) == 0) {
+      // Several OV3660 controls share register 0x5000. Give SCCB time before
+      // applying the next item from an MQTT settings batch.
+      delay(10);
+      return true;
+    }
+    delay(25 * (attempt + 1));
+  }
+  statusf("sensor setting rejected key=%s value=%d", key, static_cast<int>(value));
+  return false;
+}
+
 SettingResult applySetting(const char *key, int value, bool &streamRebuildRequired) {
   sensor_t *sensor = esp_camera_sensor_get();
   const auto requireSensor = [&]() {
@@ -789,13 +821,13 @@ SettingResult applySetting(const char *key, int value, bool &streamRebuildRequir
   if (strcmp(key, "framesize") == 0) {
     const framesize_t bounded = frameSizeFromIndex(clampValue(value, 0, 7));
     if (bounded == g_frameSize) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_framesize(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_framesize, bounded, key)) return SettingResult::failed;
     g_frameSize = bounded;
     streamRebuildRequired = true;
   } else if (strcmp(key, "jpeg_quality") == 0) {
     const int bounded = clampValue(value, 4, 63);
     if (bounded == g_jpegQuality) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_quality(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_quality, bounded, key)) return SettingResult::failed;
     g_jpegQuality = bounded;
   } else if (strcmp(key, "stream_fps") == 0) {
     const int bounded = clampValue(value, 1, 20);
@@ -804,117 +836,118 @@ SettingResult applySetting(const char *key, int value, bool &streamRebuildRequir
   } else if (strcmp(key, "brightness") == 0) {
     const int bounded = clampValue(value, -2, 2);
     if (bounded == g_brightness) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_brightness(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_brightness, bounded, key)) return SettingResult::failed;
     g_brightness = bounded;
   } else if (strcmp(key, "contrast") == 0) {
     const int bounded = clampValue(value, -2, 2);
     if (bounded == g_contrast) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_contrast(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_contrast, bounded, key)) return SettingResult::failed;
     g_contrast = bounded;
   } else if (strcmp(key, "saturation") == 0) {
     const int bounded = clampValue(value, -2, 2);
     if (bounded == g_saturation) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_saturation(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_saturation, bounded, key)) return SettingResult::failed;
     g_saturation = bounded;
   } else if (strcmp(key, "sharpness") == 0) {
     const int bounded = clampValue(value, -2, 2);
     if (bounded == g_sharpness) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_sharpness(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_sharpness, bounded, key)) return SettingResult::failed;
     g_sharpness = bounded;
   } else if (strcmp(key, "gainceiling") == 0) {
     const int bounded = clampValue(value, 0, 6);
     if (bounded == g_gainCeiling) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_gainceiling(sensor, static_cast<gainceiling_t>(bounded)) != 0) return SettingResult::failed;
+    const auto gain = static_cast<gainceiling_t>(bounded);
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_gainceiling, gain, key)) return SettingResult::failed;
     g_gainCeiling = bounded;
   } else if (strcmp(key, "colorbar") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_colorbar) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_colorbar(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_colorbar, bounded, key)) return SettingResult::failed;
     g_colorbar = bounded;
   } else if (strcmp(key, "awb") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_awb) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_whitebal(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_whitebal, bounded, key)) return SettingResult::failed;
     g_awb = bounded;
   } else if (strcmp(key, "agc") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_agc) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_gain_ctrl(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_gain_ctrl, bounded, key)) return SettingResult::failed;
     g_agc = bounded;
   } else if (strcmp(key, "aec") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_aec) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_exposure_ctrl(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_exposure_ctrl, bounded, key)) return SettingResult::failed;
     g_aec = bounded;
   } else if (strcmp(key, "awb_gain") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_awbGain) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_awb_gain(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_awb_gain, bounded, key)) return SettingResult::failed;
     g_awbGain = bounded;
   } else if (strcmp(key, "agc_gain") == 0) {
     const int bounded = clampValue(value, 0, 30);
     if (bounded == g_agcGain) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_agc_gain(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_agc_gain, bounded, key)) return SettingResult::failed;
     g_agcGain = bounded;
   } else if (strcmp(key, "aec_value") == 0) {
     const int bounded = clampValue(value, 0, 1200);
     if (bounded == g_aecValue) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_aec_value(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_aec_value, bounded, key)) return SettingResult::failed;
     g_aecValue = bounded;
   } else if (strcmp(key, "aec2") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_aec2) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_aec2(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_aec2, bounded, key)) return SettingResult::failed;
     g_aec2 = bounded;
   } else if (strcmp(key, "dcw") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_dcw) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_dcw(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_dcw, bounded, key)) return SettingResult::failed;
     g_dcw = bounded;
   } else if (strcmp(key, "bpc") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_bpc) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_bpc(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_bpc, bounded, key)) return SettingResult::failed;
     g_bpc = bounded;
   } else if (strcmp(key, "wpc") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_wpc) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_wpc(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_wpc, bounded, key)) return SettingResult::failed;
     g_wpc = bounded;
   } else if (strcmp(key, "raw_gma") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_rawGma) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_raw_gma(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_raw_gma, bounded, key)) return SettingResult::failed;
     g_rawGma = bounded;
   } else if (strcmp(key, "lenc") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_lenc) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_lenc(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_lenc, bounded, key)) return SettingResult::failed;
     g_lenc = bounded;
   } else if (strcmp(key, "special_effect") == 0) {
     const int bounded = clampValue(value, 0, 6);
     if (bounded == g_specialEffect) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_special_effect(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_special_effect, bounded, key)) return SettingResult::failed;
     g_specialEffect = bounded;
   } else if (strcmp(key, "wb_mode") == 0) {
     const int bounded = clampValue(value, 0, 4);
     if (bounded == g_wbMode) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_wb_mode(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_wb_mode, bounded, key)) return SettingResult::failed;
     g_wbMode = bounded;
   } else if (strcmp(key, "ae_level") == 0) {
     const int bounded = clampValue(value, -2, 2);
     if (bounded == g_aeLevel) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_ae_level(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_ae_level, bounded, key)) return SettingResult::failed;
     g_aeLevel = bounded;
   } else if (strcmp(key, "hmirror") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_hmirror) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_hmirror(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_hmirror, bounded, key)) return SettingResult::failed;
     g_hmirror = bounded;
   } else if (strcmp(key, "vflip") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_vflip) return SettingResult::unchanged;
-    if (!requireSensor() || sensor->set_vflip(sensor, bounded) != 0) return SettingResult::failed;
+    if (!requireSensor() || !applySensorControl(sensor, sensor->set_vflip, bounded, key)) return SettingResult::failed;
     g_vflip = bounded;
   } else if (strcmp(key, "led") == 0) {
     const int bounded = value ? 1 : 0;
@@ -971,7 +1004,7 @@ void applyControlPayload(const String &payload) {
   bool changed = false;
   bool failed = false;
   bool streamRebuildRequired = false;
-  String failedSetting;
+  String failedSettings;
   for (const char *key : keys) {
     int value = 0;
     if (!extractPayloadInt(payload, key, value)) continue;
@@ -980,7 +1013,8 @@ void applyControlPayload(const String &payload) {
     if (result == SettingResult::applied) changed = true;
     if (result == SettingResult::failed) {
       failed = true;
-      if (failedSetting.length() == 0) failedSetting = key;
+      if (failedSettings.length() > 0) failedSettings += ",";
+      failedSettings += key;
     }
   }
 
@@ -994,7 +1028,7 @@ void applyControlPayload(const String &payload) {
   if (changed) saveControllerSettings();
   if (streamRebuildRequired) rebuildStreamer();
   if (failed) {
-    const String message = "setting apply failed: " + failedSetting;
+    const String message = "setting apply failed: " + failedSettings;
     setCommandResult("set", requestId, changed ? "partial" : "error", message);
     setError(message);
   } else {
@@ -1028,12 +1062,7 @@ void applyTimelapsePayload(const String &payload) {
   publishStatus(true);
 }
 
-void mqttCallback(char *topic, byte *payload, unsigned int length) {
-  const String topicText(topic);
-  String payloadText;
-  payloadText.reserve(length + 1);
-  for (unsigned int index = 0; index < length; ++index) payloadText += static_cast<char>(payload[index]);
-  Serial.printf("[MQTT] %s: %s\n", topicText.c_str(), payloadText.c_str());
+void processMqttMessage(const String &topicText, const String &payloadText) {
   String requestId;
   extractPayloadToken(payloadText, "_request_id", requestId);
 
@@ -1076,6 +1105,27 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
     applyTimelapsePayload(payloadText);
   }
   publishStatus(true);
+}
+
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
+  const String topicText(topic);
+  String payloadText;
+  payloadText.reserve(length + 1);
+  for (unsigned int index = 0; index < length; ++index) payloadText += static_cast<char>(payload[index]);
+  Serial.printf("[MQTT] %s: %s\n", topicText.c_str(), payloadText.c_str());
+  g_pendingMqttTopic = topicText;
+  g_pendingMqttPayload = payloadText;
+  g_pendingMqttMessage = true;
+}
+
+void handlePendingMqttMessage() {
+  if (!g_pendingMqttMessage) return;
+  const String topic = g_pendingMqttTopic;
+  const String payload = g_pendingMqttPayload;
+  g_pendingMqttMessage = false;
+  g_pendingMqttTopic = "";
+  g_pendingMqttPayload = "";
+  processMqttMessage(topic, payload);
 }
 
 void ensureMqtt() {
@@ -1194,6 +1244,8 @@ void setupController() {
   digitalWrite(DFR_LED_PIN, LOW);
   digitalWrite(DFR_IR_PIN, LOW);
 
+  Wire.begin(DFR_CAM_SIOD, DFR_CAM_SIOC, 100000);
+
   g_preferences.begin("dfrcam", false);
   loadControllerSettings();
   initCamera();
@@ -1225,6 +1277,7 @@ void loopController() {
     return;
   }
   ensureMqtt();
+  handlePendingMqttMessage();
   if (g_otaReady) ArduinoOTA.handle();
   handleCameraRecovery();
   handleLightSensor();
