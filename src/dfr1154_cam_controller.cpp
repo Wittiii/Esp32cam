@@ -304,25 +304,43 @@ void publishSimple(const char *suffix, const String &value, bool retain = true) 
 }
 
 void publishExternalSensors() {
-  const dfrbme::Reading bme = dfrbme::reading();
-  publishSimple("status/bme280", dfrbme::status());
-  publishSimple("sensor/bme280/address", bme.address == 0 ? "-" : "0x" + String(bme.address, HEX));
-  publishSimple("sensor/bme280/temperature_c", bme.valid ? String(bme.temperatureC, 2) : "-");
-  publishSimple("sensor/bme280/humidity_percent", bme.valid ? String(bme.humidityPercent, 2) : "-");
-  publishSimple("sensor/bme280/pressure_hpa", bme.valid ? String(bme.pressureHpa, 2) : "-");
-  publishSimple("sensor/bme280/read_failures", String(bme.readFailures));
-  publishSimple(
-      "sensor/bme280/age_seconds",
-      bme.valid ? String((millis() - bme.lastUpdateMs) / 1000UL) : "-");
-
-  String bmeJson = "{\"status\":\"" + String(dfrbme::status()) + "\"";
-  if (bme.valid) {
-    bmeJson += ",\"temperature_c\":" + String(bme.temperatureC, 2);
-    bmeJson += ",\"humidity_percent\":" + String(bme.humidityPercent, 2);
-    bmeJson += ",\"pressure_hpa\":" + String(bme.pressureHpa, 2);
+  static bool bmePublishScheduleStarted = false;
+  static uint32_t lastBmePublishMs = 0;
+  const uint32_t now = millis();
+  if (!bmePublishScheduleStarted) {
+    bmePublishScheduleStarted = true;
+    lastBmePublishMs = now;
   }
-  bmeJson += "}";
-  publishSimple("sensor/bme280/json", bmeJson);
+  if (now - lastBmePublishMs >= dfrcfg::kBme280PublishIntervalMs) {
+    lastBmePublishMs = now;
+    const dfrbme::Reading bme = dfrbme::reading();
+    publishSimple("status/bme280", dfrbme::status());
+    publishSimple("sensor/bme280/address", bme.address == 0 ? "-" : "0x" + String(bme.address, HEX));
+    publishSimple("sensor/bme280/temperature_c", bme.valid ? String(bme.temperatureC, 2) : "-");
+    publishSimple("sensor/bme280/humidity_percent", bme.valid ? String(bme.humidityPercent, 2) : "-");
+    publishSimple("sensor/bme280/pressure_hpa", bme.valid ? String(bme.pressureHpa, 2) : "-");
+    publishSimple("sensor/bme280/latest_temperature_c", bme.valid ? String(bme.latestTemperatureC, 2) : "-");
+    publishSimple("sensor/bme280/latest_humidity_percent", bme.valid ? String(bme.latestHumidityPercent, 2) : "-");
+    publishSimple("sensor/bme280/latest_pressure_hpa", bme.valid ? String(bme.latestPressureHpa, 2) : "-");
+    publishSimple("sensor/bme280/average_samples", String(bme.averageSamples));
+    publishSimple("sensor/bme280/read_failures", String(bme.readFailures));
+    publishSimple(
+        "sensor/bme280/age_seconds",
+        bme.valid ? String((now - bme.lastUpdateMs) / 1000UL) : "-");
+
+    String bmeJson = "{\"status\":\"" + String(dfrbme::status()) + "\"";
+    if (bme.valid) {
+      bmeJson += ",\"temperature_c\":" + String(bme.temperatureC, 2);
+      bmeJson += ",\"humidity_percent\":" + String(bme.humidityPercent, 2);
+      bmeJson += ",\"pressure_hpa\":" + String(bme.pressureHpa, 2);
+      bmeJson += ",\"latest_temperature_c\":" + String(bme.latestTemperatureC, 2);
+      bmeJson += ",\"latest_humidity_percent\":" + String(bme.latestHumidityPercent, 2);
+      bmeJson += ",\"latest_pressure_hpa\":" + String(bme.latestPressureHpa, 2);
+      bmeJson += ",\"average_samples\":" + String(bme.averageSamples);
+    }
+    bmeJson += "}";
+    publishSimple("sensor/bme280/json", bmeJson);
+  }
 
   const dfrvictron::Reading victron = dfrvictron::reading();
   publishSimple("status/victron_ble", dfrvictron::status());

@@ -10,6 +10,10 @@ struct Reading {
   float temperatureC;
   float humidityPercent;
   float pressureHpa;
+  float latestTemperatureC;
+  float latestHumidityPercent;
+  float latestPressureHpa;
+  size_t averageSamples;
   uint32_t lastUpdateMs;
   uint32_t readFailures;
 };

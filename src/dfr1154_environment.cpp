@@ -2,6 +2,7 @@
 
 #include <Adafruit_BME280.h>
 #include <Wire.h>
+#include <array>
 #include <math.h>
 
 #include "dfr1154_config.h"
@@ -11,11 +12,25 @@ namespace {
 
 TwoWire g_bmeWire(1);
 Adafruit_BME280 g_bme;
-dfrbme::Reading g_reading = {false, 0, NAN, NAN, NAN, 0, 0};
+dfrbme::Reading g_reading = {false, 0, NAN, NAN, NAN, NAN, NAN, NAN, 0, 0, 0};
 bool g_wireReady = false;
 bool g_sensorReady = false;
 uint32_t g_lastProbeMs = 0;
 uint32_t g_lastReadMs = 0;
+
+struct Sample {
+  float temperatureC;
+  float humidityPercent;
+  float pressureHpa;
+};
+
+static_assert(dfrcfg::kBme280AverageSamples > 0, "BME280 average needs at least one sample");
+std::array<Sample, dfrcfg::kBme280AverageSamples> g_samples = {};
+size_t g_sampleCount = 0;
+size_t g_sampleIndex = 0;
+double g_temperatureSum = 0.0;
+double g_humiditySum = 0.0;
+double g_pressureSum = 0.0;
 
 bool probeSensor() {
   g_lastProbeMs = millis();
@@ -43,9 +58,28 @@ bool takeReading() {
     return false;
   }
 
-  g_reading.temperatureC = temperature;
-  g_reading.humidityPercent = humidity;
-  g_reading.pressureHpa = pressure;
+  if (g_sampleCount == g_samples.size()) {
+    const Sample &oldest = g_samples[g_sampleIndex];
+    g_temperatureSum -= oldest.temperatureC;
+    g_humiditySum -= oldest.humidityPercent;
+    g_pressureSum -= oldest.pressureHpa;
+  } else {
+    ++g_sampleCount;
+  }
+
+  g_samples[g_sampleIndex] = {temperature, humidity, pressure};
+  g_sampleIndex = (g_sampleIndex + 1) % g_samples.size();
+  g_temperatureSum += temperature;
+  g_humiditySum += humidity;
+  g_pressureSum += pressure;
+
+  g_reading.temperatureC = static_cast<float>(g_temperatureSum / g_sampleCount);
+  g_reading.humidityPercent = static_cast<float>(g_humiditySum / g_sampleCount);
+  g_reading.pressureHpa = static_cast<float>(g_pressureSum / g_sampleCount);
+  g_reading.latestTemperatureC = temperature;
+  g_reading.latestHumidityPercent = humidity;
+  g_reading.latestPressureHpa = pressure;
+  g_reading.averageSamples = g_sampleCount;
   g_reading.lastUpdateMs = millis();
   g_reading.valid = true;
   return true;

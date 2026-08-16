@@ -35,6 +35,8 @@ constexpr uint32_t kLightReadIntervalMs = 1000;
 
 constexpr bool kBme280Enabled = true;
 constexpr uint32_t kBme280ReadIntervalMs = 5000;
+constexpr size_t kBme280AverageSamples = 12;
+constexpr uint32_t kBme280PublishIntervalMs = 60000;
 constexpr uint32_t kBme280RetryIntervalMs = 30000;
 constexpr uint32_t kBme280StaleAfterMs = 20000;
 
