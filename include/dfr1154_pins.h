@@ -20,3 +20,7 @@
 
 #define DFR_LED_PIN 3
 #define DFR_IR_PIN 47
+
+// V1.1 Gravity connector. Its + pin supplies 3.3 V.
+#define DFR_GRAVITY_SDA 43
+#define DFR_GRAVITY_SCL 44

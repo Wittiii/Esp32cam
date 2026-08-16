@@ -22,8 +22,10 @@
 
 #include "camera_common.h"
 #include "dfr1154_config.h"
+#include "dfr1154_environment.h"
 #include "dfr1154_pins.h"
 #include "dfr1154_server_capture.h"
+#include "dfr1154_victron.h"
 #include "esp32_rtsp_streamer.h"
 
 namespace {
@@ -301,6 +303,58 @@ void publishSimple(const char *suffix, const String &value, bool retain = true) 
   }
 }
 
+void publishExternalSensors() {
+  const dfrbme::Reading bme = dfrbme::reading();
+  publishSimple("status/bme280", dfrbme::status());
+  publishSimple("sensor/bme280/address", bme.address == 0 ? "-" : "0x" + String(bme.address, HEX));
+  publishSimple("sensor/bme280/temperature_c", bme.valid ? String(bme.temperatureC, 2) : "-");
+  publishSimple("sensor/bme280/humidity_percent", bme.valid ? String(bme.humidityPercent, 2) : "-");
+  publishSimple("sensor/bme280/pressure_hpa", bme.valid ? String(bme.pressureHpa, 2) : "-");
+  publishSimple("sensor/bme280/read_failures", String(bme.readFailures));
+  publishSimple(
+      "sensor/bme280/age_seconds",
+      bme.valid ? String((millis() - bme.lastUpdateMs) / 1000UL) : "-");
+
+  String bmeJson = "{\"status\":\"" + String(dfrbme::status()) + "\"";
+  if (bme.valid) {
+    bmeJson += ",\"temperature_c\":" + String(bme.temperatureC, 2);
+    bmeJson += ",\"humidity_percent\":" + String(bme.humidityPercent, 2);
+    bmeJson += ",\"pressure_hpa\":" + String(bme.pressureHpa, 2);
+  }
+  bmeJson += "}";
+  publishSimple("sensor/bme280/json", bmeJson);
+
+  const dfrvictron::Reading victron = dfrvictron::reading();
+  publishSimple("status/victron_ble", dfrvictron::status());
+  publishSimple("victron/mppt/configured", victron.configured ? "true" : "false");
+  publishSimple("victron/mppt/charger_state", victron.valid ? dfrvictron::chargeStateName(victron.chargeState) : "-");
+  publishSimple("victron/mppt/charger_state_id", victron.valid ? String(victron.chargeState) : "-");
+  publishSimple("victron/mppt/error_code", victron.valid ? String(victron.errorCode) : "-");
+  publishSimple("victron/mppt/battery_voltage_v", victron.valid ? String(victron.batteryVoltage, 2) : "-");
+  publishSimple("victron/mppt/battery_current_a", victron.valid ? String(victron.batteryCurrent, 2) : "-");
+  publishSimple("victron/mppt/panel_power_w", victron.valid ? String(victron.panelPower, 0) : "-");
+  publishSimple("victron/mppt/yield_today_wh", victron.valid ? String(victron.yieldTodayWh) : "-");
+  publishSimple("victron/mppt/load_current_a", victron.valid ? String(victron.loadCurrent, 2) : "-");
+  publishSimple("victron/mppt/rssi", victron.valid ? String(victron.rssi) : "-");
+  publishSimple(
+      "victron/mppt/age_seconds",
+      victron.valid ? String((millis() - victron.lastUpdateMs) / 1000UL) : "-");
+
+  String victronJson = "{\"status\":\"" + String(dfrvictron::status()) + "\"";
+  if (victron.valid) {
+    victronJson += ",\"charger_state\":\"" + String(dfrvictron::chargeStateName(victron.chargeState)) + "\"";
+    victronJson += ",\"error_code\":" + String(victron.errorCode);
+    victronJson += ",\"battery_voltage_v\":" + String(victron.batteryVoltage, 2);
+    victronJson += ",\"battery_current_a\":" + String(victron.batteryCurrent, 2);
+    victronJson += ",\"panel_power_w\":" + String(victron.panelPower, 0);
+    victronJson += ",\"yield_today_wh\":" + String(victron.yieldTodayWh);
+    victronJson += ",\"load_current_a\":" + String(victron.loadCurrent, 2);
+    victronJson += ",\"rssi\":" + String(victron.rssi);
+  }
+  victronJson += "}";
+  publishSimple("victron/mppt/json", victronJson);
+}
+
 String buildConfigJson() {
   String json = "{";
   json.reserve(768);
@@ -378,6 +432,7 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/ir_mode", irModeName());
   publishSimple("status/ir_enabled", g_irEnabled ? "true" : "false");
   publishSimple("status/light_sensor", g_lightReady ? "ready" : "unavailable");
+  publishExternalSensors();
   publishSimple("status/capture_request/state", dfrcapture::state());
   publishSimple("status/capture_request/enabled", dfrcapture::enabled() ? "true" : "false");
   publishSimple("status/capture_request/interval_seconds", String(dfrcapture::intervalSeconds()));
@@ -1250,6 +1305,7 @@ void setupController() {
   loadControllerSettings();
   initCamera();
   configureLightSensor();
+  dfrbme::begin();
   dfrcapture::begin();
 
   statusf(
@@ -1265,10 +1321,12 @@ void setupController() {
   WiFi.onEvent(onWifiEvent);
   enableLoopWDT();
   ensureWifi();
+  dfrvictron::begin();
 }
 
 void loopController() {
   if (g_otaReady) ArduinoOTA.handle();
+  dfrbme::loop();
   handleWifiEvents();
   ensureWifi();
   handleNetworkServices();
@@ -1276,6 +1334,7 @@ void loopController() {
     delay(1);
     return;
   }
+  dfrvictron::loop();
   ensureMqtt();
   handlePendingMqttMessage();
   if (g_otaReady) ArduinoOTA.handle();

@@ -131,6 +131,14 @@ camera/pi-zero-01
 
 Actual archive usage and capture results are published by the Node server below `status/server_capture/*`.
 
+### Stream troubleshooting
+
+- Check `status/online` first. When it is `false`, other retained status values can be stale and commands will not reach the Pi.
+- MQTT `Bad user name or password` means the credentials in `config.json` no longer match the broker.
+- An RTSP `404 Not Found` for the configured path means MediaMTX currently has no active publisher for that path.
+- After changing `config.json` or the controller code, restart the service with `sudo systemctl restart pi-cam-controller`.
+- Inspect failures with `journalctl -u pi-cam-controller --no-pager -n 100`.
+
 ## Timelapse behavior
 
 - The Pi only publishes H.264 to MediaMTX and never writes timelapse images to its SD card.

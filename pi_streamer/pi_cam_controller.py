@@ -367,6 +367,10 @@ class CameraStreamer:
             if self._capture_process is not None:
                 LOG.info("stream already running")
                 return
+            if self._stdout_thread is not None:
+                if self._stdout_thread.is_alive():
+                    raise RuntimeError("previous stream pump is still stopping")
+                self._stdout_thread = None
 
             capture_command = self._build_capture_command()
             self._stop_requested.clear()
@@ -454,13 +458,27 @@ class CameraStreamer:
             self._capture_process = None
 
     def stop(self) -> None:
+        stdout_thread: threading.Thread | None = None
         with self._lock:
             self._stop_requested.set()
             previous_state = self._stream_state
+            stdout_thread = self._stdout_thread
+            self._stdout_thread = None
             self._cleanup_stream_handles()
             if previous_state != "error":
                 self._stream_state = "stopped"
                 self._stream_error = ""
+
+        # start() reuses the stop event. Do not allow a new run to clear it
+        # while the previous pump thread is still unwinding.
+        if stdout_thread is not None and stdout_thread is not threading.current_thread():
+            stdout_thread.join(timeout=5)
+            if stdout_thread.is_alive():
+                LOG.warning("stream pump did not stop within 5 seconds")
+                with self._lock:
+                    self._stdout_thread = stdout_thread
+                    self._stream_state = "error"
+                    self._stream_error = "previous stream pump did not stop"
         self._notify_status()
 
     def restart(self) -> None:

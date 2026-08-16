@@ -26,7 +26,7 @@
     "host": "192.168.178.56",
     "port": 1883,
     "username": "pwi",
-    "password": "1234",
+    "password": "19082004",
     "client_id": "pi-zero-01",
     "base_topic": "camera/pi-zero-01",
     "keepalive": 60

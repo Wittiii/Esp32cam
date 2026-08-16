@@ -14,7 +14,7 @@ constexpr char kMdnsHostname[] = "dfr1154-cam-01";
 constexpr char kMqttHost[] = "192.168.178.56";
 constexpr uint16_t kMqttPort = 1883;
 constexpr char kMqttUsername[] = "pwi";
-constexpr char kMqttPassword[] = "1234";
+constexpr char kMqttPassword[] = "19082004";
 constexpr char kMqttClientId[] = "dfr1154-cam-01";
 constexpr char kMqttBaseTopic[] = "camera/dfr1154-cam-01";
 
@@ -32,6 +32,19 @@ constexpr uint32_t kWifiRetryMs = 5000;
 constexpr uint32_t kMqttRetryMs = 5000;
 constexpr uint32_t kStatusIntervalMs = 5000;
 constexpr uint32_t kLightReadIntervalMs = 1000;
+
+constexpr bool kBme280Enabled = true;
+constexpr uint32_t kBme280ReadIntervalMs = 5000;
+constexpr uint32_t kBme280RetryIntervalMs = 30000;
+constexpr uint32_t kBme280StaleAfterMs = 20000;
+
+// Get both values from VictronConnect: Product info -> Instant readout details.
+constexpr bool kVictronEnabled = false;
+constexpr char kVictronName[] = "SmartSolar MPPT 150/45";
+constexpr char kVictronMac[] = "";
+constexpr char kVictronEncryptionKey[] = "";
+constexpr uint32_t kVictronScanIntervalMs = 5000;
+constexpr uint32_t kVictronStaleAfterMs = 30000;
 
 constexpr char kTimezone[] = "CET-1CEST,M3.5.0,M10.5.0/3";
 constexpr char kNtpServer1[] = "pool.ntp.org";

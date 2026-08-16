@@ -18,7 +18,7 @@ constexpr char kMdnsHostname[] = "esp32-cam-streamer";
 constexpr char kMqttHost[] = "192.168.178.56";
 constexpr uint16_t kMqttPort = 1883;
 constexpr char kMqttUsername[] = "pwi";
-constexpr char kMqttPassword[] = "1234";
+constexpr char kMqttPassword[] = "19082004";
 constexpr char kMqttClientId[] = "esp32-cam-01";
 constexpr char kMqttBaseTopic[] = "camera/esp32-cam-01";
 
