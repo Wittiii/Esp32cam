@@ -13,10 +13,14 @@ struct Reading {
   float batteryVoltage;
   float batteryCurrent;
   float panelPower;
-  uint16_t yieldTodayWh;
+  uint32_t yieldTodayWh;
   float loadCurrent;
   int8_t rssi;
   uint32_t lastUpdateMs;
+  uint32_t restartCount;
+  uint32_t scanRestartCount;
+  uint32_t advertisementCount;
+  uint32_t decodeErrorCount;
 };
 
 void begin();

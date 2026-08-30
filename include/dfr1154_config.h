@@ -2,21 +2,24 @@
 
 #include <Arduino.h>
 
+#include "dfr1154_secrets.h"
+
 namespace dfrcfg {
 
-constexpr char kWifiSsid[] = "FRITZ!Box 7590 BK";
-constexpr char kWifiPassword[] = "35428536880518248119";
+using dfrsecrets::kWifiPassword;
+using dfrsecrets::kWifiSsid;
 
 constexpr char kOtaHostname[] = "dfr1154-cam-01";
-constexpr char kOtaPassword[] = "1234";
+using dfrsecrets::kOtaPassword;
 constexpr char kMdnsHostname[] = "dfr1154-cam-01";
 
 constexpr char kMqttHost[] = "192.168.178.56";
 constexpr uint16_t kMqttPort = 1883;
-constexpr char kMqttUsername[] = "pwi";
-constexpr char kMqttPassword[] = "19082004";
+using dfrsecrets::kMqttPassword;
+using dfrsecrets::kMqttUsername;
 constexpr char kMqttClientId[] = "dfr1154-cam-01";
 constexpr char kMqttBaseTopic[] = "camera/dfr1154-cam-01";
+constexpr char kFirmwareVersion[] = "2026.08.30-dfr-nimble1";
 
 constexpr uint16_t kRtspPort = 8554;
 constexpr char kRtspPresentation[] = "mjpeg";
@@ -28,8 +31,11 @@ constexpr uint32_t kDefaultTimelapseIntervalSeconds = 60;
 constexpr float kDefaultIrOnBelowLux = 5.0f;
 constexpr float kDefaultIrOffAboveLux = 10.0f;
 
-constexpr uint32_t kWifiRetryMs = 5000;
-constexpr uint32_t kMqttRetryMs = 5000;
+constexpr uint32_t kWifiRetryInitialMs = 2000;
+constexpr uint32_t kWifiRetryMaxMs = 30000;
+constexpr uint8_t kWifiHardReconnectEvery = 6;
+constexpr uint32_t kMqttRetryInitialMs = 2000;
+constexpr uint32_t kMqttRetryMaxMs = 30000;
 constexpr uint32_t kStatusIntervalMs = 5000;
 constexpr uint32_t kLightReadIntervalMs = 1000;
 
@@ -41,12 +47,20 @@ constexpr uint32_t kBme280RetryIntervalMs = 30000;
 constexpr uint32_t kBme280StaleAfterMs = 20000;
 
 // Get both values from VictronConnect: Product info -> Instant readout details.
-constexpr bool kVictronEnabled = false;
+constexpr bool kVictronEnabled = true;
 constexpr char kVictronName[] = "SmartSolar MPPT 150/45";
-constexpr char kVictronMac[] = "";
-constexpr char kVictronEncryptionKey[] = "";
-constexpr uint32_t kVictronScanIntervalMs = 5000;
+constexpr char kVictronMac[] = "F6:61:B2:10:EC:0E";
+using dfrsecrets::kVictronEncryptionKey;
+constexpr uint32_t kVictronStartDelayMs = 60000;
+constexpr uint16_t kVictronBleScanIntervalMs = 200;
+constexpr uint16_t kVictronBleScanWindowMs = 50;
+constexpr uint32_t kVictronScanRestartCheckMs = 5000;
+constexpr uint32_t kVictronSoftRecoveryIntervalMs = 60000;
 constexpr uint32_t kVictronStaleAfterMs = 30000;
+constexpr uint32_t kVictronFirstDataTimeoutMs = 120000;
+constexpr uint32_t kVictronInitRetryMs = 60000;
+constexpr uint32_t kVictronRecoveryRebootAfterMs = 600000;
+constexpr uint8_t kVictronMaxRecoveryReboots = 2;
 
 constexpr char kTimezone[] = "CET-1CEST,M3.5.0,M10.5.0/3";
 constexpr char kNtpServer1[] = "pool.ntp.org";

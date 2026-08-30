@@ -17,6 +17,7 @@ bool g_wireReady = false;
 bool g_sensorReady = false;
 uint32_t g_lastProbeMs = 0;
 uint32_t g_lastReadMs = 0;
+uint32_t g_lastWireAttemptMs = 0;
 
 struct Sample {
   float temperatureC;
@@ -32,10 +33,28 @@ double g_temperatureSum = 0.0;
 double g_humiditySum = 0.0;
 double g_pressureSum = 0.0;
 
+void resetSampleWindow() {
+  g_samples.fill({0.0f, 0.0f, 0.0f});
+  g_sampleCount = 0;
+  g_sampleIndex = 0;
+  g_temperatureSum = 0.0;
+  g_humiditySum = 0.0;
+  g_pressureSum = 0.0;
+}
+
+void markReadingUnavailable() {
+  g_reading.valid = false;
+  g_reading.address = 0;
+  g_reading.averageSamples = 0;
+  resetSampleWindow();
+}
+
 bool probeSensor() {
   g_lastProbeMs = millis();
   for (const uint8_t address : {0x76, 0x77}) {
     if (g_bme.begin(address, &g_bmeWire)) {
+      resetSampleWindow();
+      g_reading.valid = false;
       g_sensorReady = true;
       g_reading.address = address;
       Serial.printf("[BME280] ready address=0x%02X SDA=%d SCL=%d\n",
@@ -44,6 +63,7 @@ bool probeSensor() {
     }
   }
   g_sensorReady = false;
+  markReadingUnavailable();
   Serial.println("[BME280] unavailable at 0x76/0x77");
   return false;
 }
@@ -91,8 +111,10 @@ namespace dfrbme {
 
 void begin() {
   if (!dfrcfg::kBme280Enabled || g_wireReady) return;
+  g_lastWireAttemptMs = millis();
   g_wireReady = g_bmeWire.begin(DFR_GRAVITY_SDA, DFR_GRAVITY_SCL, 100000);
   if (!g_wireReady) {
+    markReadingUnavailable();
     Serial.println("[BME280] second I2C bus initialization failed");
     return;
   }
@@ -103,7 +125,10 @@ void loop() {
   if (!dfrcfg::kBme280Enabled) return;
   const uint32_t now = millis();
   if (!g_wireReady) {
-    begin();
+    if (g_lastWireAttemptMs == 0 ||
+        now - g_lastWireAttemptMs >= dfrcfg::kBme280RetryIntervalMs) {
+      begin();
+    }
     return;
   }
   if (!g_sensorReady) {
@@ -114,6 +139,7 @@ void loop() {
   g_lastReadMs = now;
   if (!takeReading() && now - g_reading.lastUpdateMs >= dfrcfg::kBme280StaleAfterMs) {
     g_sensorReady = false;
+    markReadingUnavailable();
   }
 }
 

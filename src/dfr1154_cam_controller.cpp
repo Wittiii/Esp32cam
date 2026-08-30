@@ -13,6 +13,7 @@
 #include <WiFiServer.h>
 #include <Wire.h>
 #include <esp_camera.h>
+#include <esp_system.h>
 #include <math.h>
 #include <memory>
 #include <stdarg.h>
@@ -49,6 +50,7 @@ bool g_networkServicesPending = false;
 bool g_otaReady = false;
 bool g_otaActive = false;
 bool g_mqttEverConnected = false;
+bool g_victronBeginAttempted = false;
 
 volatile bool g_wifiGotIpEvent = false;
 volatile bool g_wifiDisconnectedEvent = false;
@@ -99,16 +101,17 @@ uint32_t g_lastFrameAtMs = 0;
 uint32_t g_lastStatsMs = 0;
 uint32_t g_lastLightReadMs = 0;
 uint32_t g_framesSent = 0;
-uint32_t g_lastCameraHealthCheckMs = 0;
 uint32_t g_lastCameraRecoveryAttemptMs = 0;
 uint32_t g_wifiReconnectCount = 0;
 uint32_t g_mqttReconnectCount = 0;
 uint32_t g_cameraRecoveryCount = 0;
 uint32_t g_mqttPublishFailures = 0;
 uint8_t g_wifiAttemptCount = 0;
+uint8_t g_mqttAttemptCount = 0;
 uint8_t g_cameraRecoveryFailures = 0;
 bool g_cameraRecoveryPending = false;
 float g_lastMeasuredFps = 0.0f;
+esp_reset_reason_t g_bootResetReason = ESP_RST_UNKNOWN;
 
 String g_lastCommandId;
 String g_lastCommandName;
@@ -172,6 +175,31 @@ String streamState() {
 
 void publishStatus(bool forceConfig = false);
 void configureLightSensor();
+
+uint32_t boundedReconnectDelay(uint8_t attempts, uint32_t initialMs, uint32_t maximumMs) {
+  uint32_t delayMs = initialMs;
+  const uint8_t steps = attempts > 1 ? attempts - 1 : 0;
+  for (uint8_t index = 0; index < steps && delayMs < maximumMs; ++index) {
+    delayMs = delayMs > maximumMs / 2UL ? maximumMs : delayMs * 2UL;
+  }
+  return delayMs;
+}
+
+const char *resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "power_on";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt_watchdog";
+    case ESP_RST_TASK_WDT: return "task_watchdog";
+    case ESP_RST_WDT: return "other_watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+  }
+}
 
 void serviceMqttDuringRtspWrite() {
   if (g_mqttClient.connected()) g_mqttClient.loop();
@@ -297,9 +325,12 @@ void ensureRtspServer() {
 
 void publishSimple(const char *suffix, const String &value, bool retain = true) {
   if (g_mqttClient.connected()) {
+    feedLoopWDT();
     if (!g_mqttClient.publish(mqttTopic(suffix).c_str(), value.c_str(), retain)) {
       ++g_mqttPublishFailures;
     }
+    feedLoopWDT();
+    delay(0);
   }
 }
 
@@ -345,6 +376,10 @@ void publishExternalSensors() {
   const dfrvictron::Reading victron = dfrvictron::reading();
   publishSimple("status/victron_ble", dfrvictron::status());
   publishSimple("victron/mppt/configured", victron.configured ? "true" : "false");
+  publishSimple("victron/mppt/restart_count", String(victron.restartCount));
+  publishSimple("victron/mppt/scan_restart_count", String(victron.scanRestartCount));
+  publishSimple("victron/mppt/advertisement_count", String(victron.advertisementCount));
+  publishSimple("victron/mppt/decode_error_count", String(victron.decodeErrorCount));
   publishSimple("victron/mppt/charger_state", victron.valid ? dfrvictron::chargeStateName(victron.chargeState) : "-");
   publishSimple("victron/mppt/charger_state_id", victron.valid ? String(victron.chargeState) : "-");
   publishSimple("victron/mppt/error_code", victron.valid ? String(victron.errorCode) : "-");
@@ -359,6 +394,10 @@ void publishExternalSensors() {
       victron.valid ? String((millis() - victron.lastUpdateMs) / 1000UL) : "-");
 
   String victronJson = "{\"status\":\"" + String(dfrvictron::status()) + "\"";
+  victronJson += ",\"restart_count\":" + String(victron.restartCount);
+  victronJson += ",\"scan_restart_count\":" + String(victron.scanRestartCount);
+  victronJson += ",\"advertisement_count\":" + String(victron.advertisementCount);
+  victronJson += ",\"decode_error_count\":" + String(victron.decodeErrorCount);
   if (victron.valid) {
     victronJson += ",\"charger_state\":\"" + String(dfrvictron::chargeStateName(victron.chargeState)) + "\"";
     victronJson += ",\"error_code\":" + String(victron.errorCode);
@@ -441,7 +480,9 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/wifi_rssi", String(WiFi.RSSI()));
   publishSimple("status/uptime_seconds", String(millis() / 1000UL));
   publishSimple("status/free_heap_bytes", String(ESP.getFreeHeap()));
-  publishSimple("status/firmware_version", camcommon::kFirmwareVersion);
+  publishSimple("status/min_free_heap_bytes", String(ESP.getMinFreeHeap()));
+  publishSimple("status/reset_reason", resetReasonName(g_bootResetReason));
+  publishSimple("status/firmware_version", dfrcfg::kFirmwareVersion);
   publishSimple("status/wifi_reconnect_count", String(g_wifiReconnectCount));
   publishSimple("status/mqtt_reconnect_count", String(g_mqttReconnectCount));
   publishSimple("status/camera_recovery_count", String(g_cameraRecoveryCount));
@@ -685,21 +726,6 @@ void requestCameraRecovery(const String &reason) {
 
 void handleCameraRecovery() {
   const uint32_t now = millis();
-
-  if (g_cameraReady && !g_cameraRecoveryPending) {
-    if (!g_streamEnabled || directStreamingSessionCount() > 0 ||
-        now - g_lastCameraHealthCheckMs < 30000UL) {
-      return;
-    }
-    g_lastCameraHealthCheckMs = now;
-    camera_fb_t *frame = esp_camera_fb_get();
-    if (frame != nullptr) {
-      esp_camera_fb_return(frame);
-      return;
-    }
-    requestCameraRecovery("health probe failed");
-  }
-
   if (g_cameraReady && !g_cameraRecoveryPending) return;
   if (now - g_lastCameraRecoveryAttemptMs < 10000UL) return;
   g_lastCameraRecoveryAttemptMs = now;
@@ -799,6 +825,7 @@ void handleWifiEvents() {
     if (g_mqttClient.connected()) g_mqttClient.disconnect();
     g_mqttSocket.stop();
     g_lastMqttAttemptMs = 0;
+    g_mqttAttemptCount = 0;
     if (g_otaReady) {
       ArduinoOTA.end();
       g_otaReady = false;
@@ -836,7 +863,9 @@ void handleNetworkServices() {
 void ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) return;
   const uint32_t now = millis();
-  if (g_lastWifiAttemptMs != 0 && now - g_lastWifiAttemptMs < dfrcfg::kWifiRetryMs) return;
+  const uint32_t retryDelay = boundedReconnectDelay(
+      g_wifiAttemptCount, dfrcfg::kWifiRetryInitialMs, dfrcfg::kWifiRetryMaxMs);
+  if (g_lastWifiAttemptMs != 0 && now - g_lastWifiAttemptMs < retryDelay) return;
   g_lastWifiAttemptMs = now;
   ++g_wifiAttemptCount;
 
@@ -844,8 +873,9 @@ void ensureWifi() {
     g_wifiStarted = true;
     statusf("wifi connecting ssid=%s", dfrcfg::kWifiSsid);
     WiFi.begin(dfrcfg::kWifiSsid, dfrcfg::kWifiPassword);
-  } else if (g_wifiAttemptCount % 6 == 0) {
+  } else if (g_wifiAttemptCount % dfrcfg::kWifiHardReconnectEvery == 0) {
     recordStatus("wifi stack reconnect");
+    WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, false);
     delay(20);
     WiFi.begin(dfrcfg::kWifiSsid, dfrcfg::kWifiPassword);
@@ -1202,13 +1232,29 @@ void handlePendingMqttMessage() {
 }
 
 void ensureMqtt() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (g_mqttClient.connected()) g_mqttClient.disconnect();
+    g_mqttSocket.stop();
+    g_mqttAttemptCount = 0;
+    g_lastMqttAttemptMs = 0;
+    return;
+  }
   g_mqttClient.loop();
-  if (g_mqttClient.connected()) return;
+  if (g_mqttClient.connected()) {
+    g_mqttAttemptCount = 0;
+    return;
+  }
 
   const uint32_t now = millis();
-  if (now - g_lastMqttAttemptMs < dfrcfg::kMqttRetryMs) return;
+  const uint32_t retryDelay = boundedReconnectDelay(
+      g_mqttAttemptCount, dfrcfg::kMqttRetryInitialMs, dfrcfg::kMqttRetryMaxMs);
+  if (g_lastMqttAttemptMs != 0 && now - g_lastMqttAttemptMs < retryDelay) return;
   g_lastMqttAttemptMs = now;
+  ++g_mqttAttemptCount;
+
+  g_mqttClient.disconnect();
+  g_mqttSocket.stop();
+  delay(5);
 
   g_mqttClient.setServer(dfrcfg::kMqttHost, dfrcfg::kMqttPort);
   g_mqttClient.setCallback(mqttCallback);
@@ -1235,6 +1281,7 @@ void ensureMqtt() {
     return;
   }
 
+  g_mqttAttemptCount = 0;
   if (g_mqttEverConnected) ++g_mqttReconnectCount;
   g_mqttEverConnected = true;
 
@@ -1303,6 +1350,16 @@ void updateRuntimeStats() {
   publishStatus();
 }
 
+void ensureVictron() {
+  if (g_victronBeginAttempted || !dfrcfg::kVictronEnabled) return;
+  if (millis() < dfrcfg::kVictronStartDelayMs) return;
+  if (WiFi.status() != WL_CONNECTED || !g_mqttClient.connected()) return;
+
+  g_victronBeginAttempted = true;
+  recordStatus("victron BLE initializing");
+  dfrvictron::begin();
+}
+
 }  // namespace
 
 namespace dfr1154 {
@@ -1310,6 +1367,7 @@ namespace dfr1154 {
 void setupController() {
   Serial.begin(115200);
   delay(500);
+  g_bootResetReason = esp_reset_reason();
   Serial.println("\n[BOOT] DFR1154 camera controller starting");
 
   pinMode(DFR_LED_PIN, OUTPUT);
@@ -1339,7 +1397,6 @@ void setupController() {
   WiFi.onEvent(onWifiEvent);
   enableLoopWDT();
   ensureWifi();
-  dfrvictron::begin();
 }
 
 void loopController() {
@@ -1354,6 +1411,7 @@ void loopController() {
   }
   dfrvictron::loop();
   ensureMqtt();
+  ensureVictron();
   handlePendingMqttMessage();
   if (g_otaReady) ArduinoOTA.handle();
   handleCameraRecovery();
