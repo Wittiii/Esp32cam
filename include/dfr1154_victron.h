@@ -8,15 +8,20 @@ struct Reading {
   bool configured;
   bool initialized;
   bool valid;
+
   uint8_t chargeState;
   uint8_t errorCode;
+
   float batteryVoltage;
   float batteryCurrent;
   float panelPower;
   uint32_t yieldTodayWh;
   float loadCurrent;
+
   int8_t rssi;
+
   uint32_t lastUpdateMs;
+
   uint32_t restartCount;
   uint32_t scanRestartCount;
   uint32_t advertisementCount;
@@ -25,8 +30,17 @@ struct Reading {
 
 void begin();
 void loop();
+
 Reading reading();
+
 const char *status();
 const char *chargeStateName(uint8_t state);
+
+// ----------------------------------------------------
+// BLE Debug
+// bleibt über Panic/Watchdog-Reboot im RTC RAM erhalten
+// ----------------------------------------------------
+const char *debugStage();
+uint32_t debugStageCode();
 
 }  // namespace dfrvictron

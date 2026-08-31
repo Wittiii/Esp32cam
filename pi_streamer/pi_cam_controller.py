@@ -1,6 +1,8 @@
 import argparse
 import json
 import logging
+import os
+import select
 import socket
 import subprocess
 import threading
@@ -307,22 +309,51 @@ class CameraStreamer:
         process = self._publish_process
         if process is None or process.stdin is None:
             raise RuntimeError("publish process is not available")
-        process.stdin.write(chunk)
-        process.stdin.flush()
+        descriptor = process.stdin.fileno()
+        os.set_blocking(descriptor, False)
+        remaining = memoryview(chunk)
+
+        while remaining:
+            if self._is_stopping():
+                raise InterruptedError("stream stop requested")
+            if process.poll() is not None:
+                raise BrokenPipeError(f"publisher exited with code {process.returncode}")
+
+            _, writable, _ = select.select([], [descriptor], [], 0.5)
+            if not writable:
+                continue
+            try:
+                written = os.write(descriptor, remaining)
+            except BlockingIOError:
+                continue
+            if written <= 0:
+                raise BrokenPipeError("publisher pipe closed")
+            remaining = remaining[written:]
 
     def _stop_after_failure(self, reason: str) -> None:
         self._set_stream_state("error", reason)
         self.stop()
 
-    def _pump_stdout(self) -> None:
+    def _run_stream_pump(self) -> None:
         assert self._capture_process is not None
         assert self._capture_process.stdout is not None
 
+        capture_process = self._capture_process
         capture_stdout = self._capture_process.stdout
+        capture_descriptor = capture_stdout.fileno()
+        os.set_blocking(capture_descriptor, False)
 
         try:
             while not self._is_stopping():
-                chunk = capture_stdout.read(64 * 1024)
+                readable, _, _ = select.select([capture_descriptor], [], [], 0.5)
+                if not readable:
+                    if capture_process.poll() is not None:
+                        break
+                    continue
+                try:
+                    chunk = os.read(capture_descriptor, 64 * 1024)
+                except BlockingIOError:
+                    continue
                 if not chunk:
                     break
 
@@ -361,6 +392,15 @@ class CameraStreamer:
             self._stop_after_failure(f"capture exited with code {capture_code}")
             return
         self._stop_after_failure("stream ended")
+
+    def _pump_stdout(self) -> None:
+        try:
+            self._run_stream_pump()
+        finally:
+            current_thread = threading.current_thread()
+            with self._lock:
+                if self._stdout_thread is current_thread:
+                    self._stdout_thread = None
 
     def start(self) -> None:
         with self._lock:
@@ -446,6 +486,10 @@ class CameraStreamer:
                     self._publish_process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self._publish_process.kill()
+                    try:
+                        self._publish_process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        LOG.error("publisher process did not exit after SIGKILL")
             self._publish_process = None
 
         if self._capture_process is not None:
@@ -455,6 +499,10 @@ class CameraStreamer:
                     self._capture_process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self._capture_process.kill()
+                    try:
+                        self._capture_process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        LOG.error("capture process did not exit after SIGKILL")
             self._capture_process = None
 
     def stop(self) -> None:
@@ -463,7 +511,6 @@ class CameraStreamer:
             self._stop_requested.set()
             previous_state = self._stream_state
             stdout_thread = self._stdout_thread
-            self._stdout_thread = None
             self._cleanup_stream_handles()
             if previous_state != "error":
                 self._stream_state = "stopped"
@@ -479,6 +526,10 @@ class CameraStreamer:
                     self._stdout_thread = stdout_thread
                     self._stream_state = "error"
                     self._stream_error = "previous stream pump did not stop"
+            else:
+                with self._lock:
+                    if self._stdout_thread is stdout_thread:
+                        self._stdout_thread = None
         self._notify_status()
 
     def restart(self) -> None:

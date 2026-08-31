@@ -49,7 +49,7 @@ constexpr uint32_t kBme280StaleAfterMs = 20000;
 // Get both values from VictronConnect: Product info -> Instant readout details.
 constexpr bool kVictronEnabled = true;
 constexpr char kVictronName[] = "SmartSolar MPPT 150/45";
-constexpr char kVictronMac[] = "F6:61:B2:10:EC:0E";
+constexpr char kVictronMac[] = "f661b210ec0e";
 using dfrsecrets::kVictronEncryptionKey;
 constexpr uint32_t kVictronStartDelayMs = 60000;
 constexpr uint16_t kVictronBleScanIntervalMs = 200;

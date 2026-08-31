@@ -1136,7 +1136,7 @@ void setupController() {
 
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
-  WiFi.setSleep(false);
+  WiFi.setSleep(true);
   WiFi.setAutoReconnect(true);
   WiFi.onEvent(onWiFiEvent);
   enableLoopWDT();

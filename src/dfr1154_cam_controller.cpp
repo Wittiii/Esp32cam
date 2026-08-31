@@ -375,6 +375,13 @@ void publishExternalSensors() {
 
   const dfrvictron::Reading victron = dfrvictron::reading();
   publishSimple("status/victron_ble", dfrvictron::status());
+  publishSimple(
+    "status/victron_ble_stage",
+    dfrvictron::debugStage());
+
+publishSimple(
+    "status/victron_ble_stage_code",
+    String(dfrvictron::debugStageCode()));
   publishSimple("victron/mppt/configured", victron.configured ? "true" : "false");
   publishSimple("victron/mppt/restart_count", String(victron.restartCount));
   publishSimple("victron/mppt/scan_restart_count", String(victron.scanRestartCount));
