@@ -10,8 +10,51 @@
 
 namespace {
 
+class BoundedBme280 : public Adafruit_BME280 {
+ public:
+  bool begin(uint8_t address, TwoWire *wire) {
+    // Adafruit's init() waits forever when the calibration-ready bit stays
+    // set. Bound that wait and propagate I2C errors so a bad sensor cannot
+    // hold the camera/MQTT loop until the watchdog reboots the board.
+    delete i2c_dev;
+    i2c_dev = new Adafruit_I2CDevice(address, wire);
+    if (!i2c_dev->begin()) return false;
+    uint8_t chipId = 0;
+    if (!readRegister(BME280_REGISTER_CHIPID, chipId) || chipId != 0x60) return false;
+    _sensorID = chipId;
+    const uint8_t reset[] = {BME280_REGISTER_SOFTRESET, 0xB6};
+    if (!i2c_dev->write(reset, sizeof(reset))) return false;
+    delay(10);
+    const uint32_t start = millis();
+    for (;;) {
+      uint8_t status = 0;
+      if (!readRegister(BME280_REGISTER_STATUS, status)) return false;
+      if ((status & 0x01) == 0) break;
+      if (millis() - start >= 200UL) return false;
+      delay(5);
+    }
+    readCoefficients();
+    if (_bme280_calib.dig_T1 == 0 || _bme280_calib.dig_T1 == 0xFFFF ||
+        _bme280_calib.dig_P1 == 0 || _bme280_calib.dig_P1 == 0xFFFF ||
+        !readRegister(BME280_REGISTER_CHIPID, chipId) || chipId != 0x60) return false;
+    setSampling();
+    delay(100);
+    return true;
+  }
+
+  bool connected() {
+    uint8_t chipId = 0;
+    return readRegister(BME280_REGISTER_CHIPID, chipId) && chipId == 0x60;
+  }
+
+ private:
+  bool readRegister(uint8_t reg, uint8_t &value) {
+    return i2c_dev != nullptr && i2c_dev->write_then_read(&reg, 1, &value, 1);
+  }
+};
+
 TwoWire g_bmeWire(1);
-Adafruit_BME280 g_bme;
+BoundedBme280 g_bme;
 dfrbme::Reading g_reading = {false, 0, NAN, NAN, NAN, NAN, NAN, NAN, 0, 0, 0};
 bool g_wireReady = false;
 bool g_sensorReady = false;
@@ -69,10 +112,15 @@ bool probeSensor() {
 }
 
 bool takeReading() {
+  if (!g_bme.connected()) {
+    ++g_reading.readFailures;
+    return false;
+  }
   const float temperature = g_bme.readTemperature();
   const float humidity = g_bme.readHumidity();
   const float pressure = g_bme.readPressure() / 100.0f;
-  if (!isfinite(temperature) || !isfinite(humidity) || !isfinite(pressure) ||
+  if (!g_bme.connected() || !isfinite(temperature) || !isfinite(humidity) || !isfinite(pressure) ||
+      temperature < -40.0f || temperature > 85.0f ||
       humidity < 0.0f || humidity > 100.0f || pressure < 100.0f || pressure > 1200.0f) {
     ++g_reading.readFailures;
     return false;
@@ -118,7 +166,11 @@ void begin() {
     Serial.println("[BME280] second I2C bus initialization failed");
     return;
   }
-  if (probeSensor()) takeReading();
+  g_bmeWire.setTimeOut(50);
+  if (probeSensor()) {
+    takeReading();
+    g_lastReadMs = millis();
+  }
 }
 
 void loop() {

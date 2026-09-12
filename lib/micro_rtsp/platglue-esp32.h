@@ -59,10 +59,7 @@ inline UDPSOCKET udpsocketcreate(unsigned short portNum)
 }
 
 // TCP sending
-inline ssize_t socketsend(SOCKET sockfd, const void *buf, size_t len)
-{
-    return sockfd->write((uint8_t *) buf, len);
-}
+inline ssize_t socketsend(SOCKET sockfd, const void *buf, size_t len);
 
 // Keep a slow RTP reader from blocking every service in the camera loop.
 // Partial TCP writes would corrupt an interleaved RTP packet, therefore the
@@ -87,6 +84,12 @@ inline ssize_t sockettrysend(SOCKET sockfd, const void *buf, size_t len)
     if (totalSent == len) return static_cast<ssize_t>(totalSent);
     sockfd->stop();
     return -1;
+}
+
+// Bound normal RTSP responses too; WiFiClient::write can retry for seconds.
+inline ssize_t socketsend(SOCKET sockfd, const void *buf, size_t len)
+{
+    return sockettrysend(sockfd, buf, len);
 }
 
 inline ssize_t udpsocketsend(UDPSOCKET sockfd, const void *buf, size_t len,

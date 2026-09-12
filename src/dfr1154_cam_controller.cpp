@@ -14,14 +14,17 @@
 #include <Wire.h>
 #include <esp_camera.h>
 #include <esp_system.h>
+#include <array>
 #include <math.h>
 #include <memory>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <utility>
 
 #include "camera_common.h"
+#include "bounded_mqtt_socket.h"
 #include "dfr1154_config.h"
 #include "dfr1154_environment.h"
 #include "dfr1154_pins.h"
@@ -32,7 +35,7 @@
 namespace {
 
 WiFiServer g_rtspServer(dfrcfg::kRtspPort);
-WiFiClient g_mqttSocket;
+BoundedMqttSocket g_mqttSocket;
 PubSubClient g_mqttClient(g_mqttSocket);
 Preferences g_preferences;
 DFRobot_LTR308 g_lightSensor;
@@ -51,10 +54,15 @@ bool g_otaReady = false;
 bool g_otaActive = false;
 bool g_mqttEverConnected = false;
 bool g_victronBeginAttempted = false;
+bool g_statusPublishPending = false;
+bool g_configPublishPending = false;
+bool g_preferencesReady = false;
+bool g_loopWdtReady = false;
 
 volatile bool g_wifiGotIpEvent = false;
 volatile bool g_wifiDisconnectedEvent = false;
 volatile uint8_t g_wifiDisconnectReason = 0;
+portMUX_TYPE g_wifiEventMux = portMUX_INITIALIZER_UNLOCKED;
 
 framesize_t g_frameSize = FRAMESIZE_UXGA;
 int g_jpegQuality = 10;
@@ -100,14 +108,15 @@ uint32_t g_lastMqttAttemptMs = 0;
 uint32_t g_lastFrameAtMs = 0;
 uint32_t g_lastStatsMs = 0;
 uint32_t g_lastLightReadMs = 0;
+uint32_t g_lastLightProbeMs = 0;
 uint32_t g_framesSent = 0;
 uint32_t g_lastCameraRecoveryAttemptMs = 0;
 uint32_t g_wifiReconnectCount = 0;
 uint32_t g_mqttReconnectCount = 0;
 uint32_t g_cameraRecoveryCount = 0;
 uint32_t g_mqttPublishFailures = 0;
-uint8_t g_wifiAttemptCount = 0;
-uint8_t g_mqttAttemptCount = 0;
+uint32_t g_wifiAttemptCount = 0;
+uint32_t g_mqttAttemptCount = 0;
 uint8_t g_cameraRecoveryFailures = 0;
 bool g_cameraRecoveryPending = false;
 float g_lastMeasuredFps = 0.0f;
@@ -118,9 +127,16 @@ String g_lastCommandName;
 String g_lastCommandResult = "none";
 String g_lastCommandMessage;
 uint32_t g_lastCommandAtMs = 0;
-String g_pendingMqttTopic;
-String g_pendingMqttPayload;
-bool g_pendingMqttMessage = false;
+struct PendingMqttMessage {
+  String topic;
+  String payload;
+};
+// PubSubClient callbacks also run while a frame is being sent. Queue commands
+// until the main loop can safely apply them without destroying that streamer.
+std::array<PendingMqttMessage, 8> g_pendingMqttMessages;
+size_t g_pendingMqttHead = 0;
+size_t g_pendingMqttCount = 0;
+uint32_t g_mqttCommandDrops = 0;
 
 int clampValue(int value, int minimum, int maximum) {
   return camcommon::clampInt(value, minimum, maximum);
@@ -174,12 +190,13 @@ String streamState() {
 }
 
 void publishStatus(bool forceConfig = false);
+void flushStatus();
 void configureLightSensor();
 
-uint32_t boundedReconnectDelay(uint8_t attempts, uint32_t initialMs, uint32_t maximumMs) {
+uint32_t boundedReconnectDelay(uint32_t attempts, uint32_t initialMs, uint32_t maximumMs) {
   uint32_t delayMs = initialMs;
-  const uint8_t steps = attempts > 1 ? attempts - 1 : 0;
-  for (uint8_t index = 0; index < steps && delayMs < maximumMs; ++index) {
+  const uint32_t steps = attempts > 1 ? attempts - 1 : 0;
+  for (uint32_t index = 0; index < steps && delayMs < maximumMs; ++index) {
     delayMs = delayMs > maximumMs / 2UL ? maximumMs : delayMs * 2UL;
   }
   return delayMs;
@@ -278,7 +295,21 @@ void evaluateIrAutomation() {
 
 bool readAmbientLuxNow() {
   if (!g_lightReady) return false;
-  const uint32_t raw = g_lightSensor.getData();
+  // The library's getData() returns zero on I2C failure, which would otherwise
+  // be interpreted as darkness and switch the IR light on.
+  Wire.beginTransmission(LTR308_ADDR);
+  Wire.write(LTR308_REG_DATA_0);
+  if (Wire.endTransmission(false) != 0 ||
+      Wire.requestFrom(static_cast<uint8_t>(LTR308_ADDR), static_cast<uint8_t>(3)) != 3) {
+    g_ambientLux = NAN;
+    g_lightReady = false;
+    g_lastLightProbeMs = millis();
+    return false;
+  }
+  const uint32_t low = Wire.read();
+  const uint32_t middle = Wire.read();
+  const uint32_t high = Wire.read();
+  const uint32_t raw = ((high & 0x0FUL) << 16) | (middle << 8) | low;
   const double lux = g_lightSensor.getLux(raw);
   if (!isfinite(lux) || lux < 0.0) return false;
   g_ambientLux = static_cast<float>(lux);
@@ -287,8 +318,11 @@ bool readAmbientLuxNow() {
 }
 
 void handleLightSensor() {
-  if (!g_lightReady) return;
   const uint32_t now = millis();
+  if (!g_lightReady) {
+    if (now - g_lastLightProbeMs >= 30000UL) configureLightSensor();
+    return;
+  }
   if (now - g_lastLightReadMs < dfrcfg::kLightReadIntervalMs) return;
   g_lastLightReadMs = now;
   readAmbientLuxNow();
@@ -323,15 +357,21 @@ void ensureRtspServer() {
   statusf("rtsp server listening port=%u", dfrcfg::kRtspPort);
 }
 
-void publishSimple(const char *suffix, const String &value, bool retain = true) {
+bool publishSimple(const char *suffix, const String &value, bool retain = true) {
   if (g_mqttClient.connected()) {
     feedLoopWDT();
     if (!g_mqttClient.publish(mqttTopic(suffix).c_str(), value.c_str(), retain)) {
       ++g_mqttPublishFailures;
+      // A failed/partial packet must not be followed by more packets on the
+      // same TCP stream; reconnect and resend retained status instead.
+      g_mqttSocket.stop();
+      return false;
     }
     feedLoopWDT();
     delay(0);
+    return true;
   }
+  return false;
 }
 
 void publishExternalSensors() {
@@ -344,7 +384,8 @@ void publishExternalSensors() {
   }
   if (now - lastBmePublishMs >= dfrcfg::kBme280PublishIntervalMs) {
     lastBmePublishMs = now;
-    const dfrbme::Reading bme = dfrbme::reading();
+    dfrbme::Reading bme = dfrbme::reading();
+    bme.valid = bme.valid && now - bme.lastUpdateMs < dfrcfg::kBme280StaleAfterMs;
     publishSimple("status/bme280", dfrbme::status());
     publishSimple("sensor/bme280/address", bme.address == 0 ? "-" : "0x" + String(bme.address, HEX));
     publishSimple("sensor/bme280/temperature_c", bme.valid ? String(bme.temperatureC, 2) : "-");
@@ -360,6 +401,7 @@ void publishExternalSensors() {
         bme.valid ? String((now - bme.lastUpdateMs) / 1000UL) : "-");
 
     String bmeJson = "{\"status\":\"" + String(dfrbme::status()) + "\"";
+    bmeJson += bme.valid ? ",\"valid\":true" : ",\"valid\":false";
     if (bme.valid) {
       bmeJson += ",\"temperature_c\":" + String(bme.temperatureC, 2);
       bmeJson += ",\"humidity_percent\":" + String(bme.humidityPercent, 2);
@@ -373,7 +415,9 @@ void publishExternalSensors() {
     publishSimple("sensor/bme280/json", bmeJson);
   }
 
-  const dfrvictron::Reading victron = dfrvictron::reading();
+  dfrvictron::Reading victron = dfrvictron::reading();
+  victron.valid = victron.valid &&
+      millis() - victron.lastUpdateMs < dfrcfg::kVictronStaleAfterMs;
   publishSimple("status/victron_ble", dfrvictron::status());
   publishSimple(
     "status/victron_ble_stage",
@@ -401,6 +445,7 @@ publishSimple(
       victron.valid ? String((millis() - victron.lastUpdateMs) / 1000UL) : "-");
 
   String victronJson = "{\"status\":\"" + String(dfrvictron::status()) + "\"";
+  victronJson += victron.valid ? ",\"valid\":true" : ",\"valid\":false";
   victronJson += ",\"restart_count\":" + String(victron.restartCount);
   victronJson += ",\"scan_restart_count\":" + String(victron.scanRestartCount);
   victronJson += ",\"advertisement_count\":" + String(victron.advertisementCount);
@@ -468,8 +513,16 @@ String buildConfigJson() {
 }
 
 void publishStatus(bool forceConfig) {
+  g_statusPublishPending = true;
+  g_configPublishPending = g_configPublishPending || forceConfig;
+}
+
+void flushStatus() {
   static String previousConfig;
-  if (!g_mqttClient.connected()) return;
+  if (!g_statusPublishPending || !g_mqttClient.connected()) return;
+  const bool forceConfig = g_configPublishPending;
+  g_statusPublishPending = false;
+  g_configPublishPending = false;
 
   publishSimple("status/online", "true");
   publishSimple("status/state", streamState());
@@ -494,6 +547,7 @@ void publishStatus(bool forceConfig) {
   publishSimple("status/mqtt_reconnect_count", String(g_mqttReconnectCount));
   publishSimple("status/camera_recovery_count", String(g_cameraRecoveryCount));
   publishSimple("status/mqtt_publish_failures", String(g_mqttPublishFailures));
+  publishSimple("status/mqtt_command_drops", String(g_mqttCommandDrops));
   publishSimple("status/ambient_lux", isfinite(g_ambientLux) ? String(g_ambientLux, 2) : "-");
   publishSimple("status/ir_mode", irModeName());
   publishSimple("status/ir_enabled", g_irEnabled ? "true" : "false");
@@ -510,43 +564,50 @@ void publishStatus(bool forceConfig) {
 
   const String config = buildConfigJson();
   if (forceConfig || config != previousConfig) {
-    publishSimple("status/config", config);
-    previousConfig = config;
+    if (publishSimple("status/config", config)) previousConfig = config;
   }
 }
 
-void saveControllerSettings() {
-  g_preferences.putInt("framesize", frameSizeToIndex(g_frameSize));
-  g_preferences.putInt("quality", g_jpegQuality);
-  g_preferences.putInt("fps", g_streamFps);
-  g_preferences.putInt("bright", g_brightness);
-  g_preferences.putInt("contrast", g_contrast);
-  g_preferences.putInt("saturate", g_saturation);
-  g_preferences.putInt("sharp", g_sharpness);
-  g_preferences.putInt("gainceil", g_gainCeiling);
-  g_preferences.putInt("colorbar", g_colorbar);
-  g_preferences.putInt("awb", g_awb);
-  g_preferences.putInt("agc", g_agc);
-  g_preferences.putInt("aec", g_aec);
-  g_preferences.putInt("awbgain", g_awbGain);
-  g_preferences.putInt("agcgain", g_agcGain);
-  g_preferences.putInt("aecvalue", g_aecValue);
-  g_preferences.putInt("aec2", g_aec2);
-  g_preferences.putInt("dcw", g_dcw);
-  g_preferences.putInt("bpc", g_bpc);
-  g_preferences.putInt("wpc", g_wpc);
-  g_preferences.putInt("rawgma", g_rawGma);
-  g_preferences.putInt("lenc", g_lenc);
-  g_preferences.putInt("effect", g_specialEffect);
-  g_preferences.putInt("wbmode", g_wbMode);
-  g_preferences.putInt("aelevel", g_aeLevel);
-  g_preferences.putInt("hmirror", g_hmirror);
-  g_preferences.putInt("vflip", g_vflip);
-  g_preferences.putBool("led", g_ledEnabled != 0);
-  g_preferences.putBool("stream", g_streamEnabled);
-  g_preferences.putInt("irmode", g_irMode);
-  g_preferences.putFloat("ironlux", g_irOnBelowLux);
-  g_preferences.putFloat("irofflux", g_irOffAboveLux);
+bool saveControllerSettings() {
+  if (!g_preferencesReady) {
+    setError("settings storage unavailable");
+    return false;
+  }
+  // Each Preferences put commits to flash. A one-slider change must not write
+  // every setting again, especially while the camera is streaming.
+  const struct { const char *key; int value; } integers[] = {
+      {"framesize", frameSizeToIndex(g_frameSize)}, {"quality", g_jpegQuality},
+      {"fps", g_streamFps}, {"bright", g_brightness}, {"contrast", g_contrast},
+      {"saturate", g_saturation}, {"sharp", g_sharpness}, {"gainceil", g_gainCeiling},
+      {"colorbar", g_colorbar}, {"awb", g_awb}, {"agc", g_agc}, {"aec", g_aec},
+      {"awbgain", g_awbGain}, {"agcgain", g_agcGain}, {"aecvalue", g_aecValue},
+      {"aec2", g_aec2}, {"dcw", g_dcw}, {"bpc", g_bpc}, {"wpc", g_wpc},
+      {"rawgma", g_rawGma}, {"lenc", g_lenc}, {"effect", g_specialEffect},
+      {"wbmode", g_wbMode}, {"aelevel", g_aeLevel}, {"hmirror", g_hmirror},
+      {"vflip", g_vflip}, {"irmode", g_irMode}};
+  bool success = true;
+  for (const auto &setting : integers) {
+    if ((!g_preferences.isKey(setting.key) ||
+         g_preferences.getInt(setting.key) != setting.value) &&
+        g_preferences.putInt(setting.key, setting.value) != sizeof(int32_t)) {
+      success = false;
+    }
+    if (g_loopWdtReady) feedLoopWDT();
+  }
+  const auto saveBool = [&](const char *key, bool value) {
+    if ((!g_preferences.isKey(key) || g_preferences.getBool(key) != value) &&
+        g_preferences.putBool(key, value) != sizeof(uint8_t)) success = false;
+  };
+  const auto saveFloat = [&](const char *key, float value) {
+    if ((!g_preferences.isKey(key) || g_preferences.getFloat(key) != value) &&
+        g_preferences.putFloat(key, value) != sizeof(float)) success = false;
+  };
+  saveBool("led", g_ledEnabled != 0);
+  saveBool("stream", g_streamEnabled);
+  saveFloat("ironlux", g_irOnBelowLux);
+  saveFloat("irofflux", g_irOffAboveLux);
+  if (!success) setError("settings applied but saving to flash failed");
+  return success;
 }
 
 void loadControllerSettings() {
@@ -583,6 +644,10 @@ void loadControllerSettings() {
   g_irMode = clampValue(g_preferences.getInt("irmode", 2), 0, 2);
   g_irOnBelowLux = g_preferences.getFloat("ironlux", dfrcfg::kDefaultIrOnBelowLux);
   g_irOffAboveLux = g_preferences.getFloat("irofflux", dfrcfg::kDefaultIrOffAboveLux);
+  if (!isfinite(g_irOnBelowLux) || g_irOnBelowLux < 0 || g_irOnBelowLux > 100000)
+    g_irOnBelowLux = dfrcfg::kDefaultIrOnBelowLux;
+  if (!isfinite(g_irOffAboveLux) || g_irOffAboveLux < 1 || g_irOffAboveLux > 100002)
+    g_irOffAboveLux = dfrcfg::kDefaultIrOffAboveLux;
   if (g_irOffAboveLux <= g_irOnBelowLux) g_irOffAboveLux = g_irOnBelowLux + 2.0f;
 
   // Match DFRobot's CameraWebServer defaults once; later user changes remain persistent.
@@ -594,11 +659,9 @@ void loadControllerSettings() {
     g_saturation = -2;
     g_sharpness = 0;
     g_vflip = 1;
-    saveControllerSettings();
   }
   if (configVersion < 3) {
-    saveControllerSettings();
-    g_preferences.putUChar("cfgver", 3);
+    if (saveControllerSettings()) g_preferences.putUChar("cfgver", 3);
   }
 }
 
@@ -754,6 +817,7 @@ void handleCameraRecovery() {
 }
 
 void configureLightSensor() {
+  g_lastLightProbeMs = millis();
   g_lightReady = false;
   g_ambientLux = NAN;
   g_lightReady = g_lightSensor.begin();
@@ -782,6 +846,7 @@ void configureOta() {
     g_streamer.reset();
     recordStatus("ota update started; camera stream suspended");
     publishStatus();
+    flushStatus();
   });
   ArduinoOTA.onEnd([]() { recordStatus("ota update finished"); });
   ArduinoOTA.onProgress([](unsigned int, unsigned int) { feedLoopWDT(); });
@@ -807,6 +872,7 @@ void configureMdns() {
 }
 
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  portENTER_CRITICAL(&g_wifiEventMux);
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       g_wifiGotIpEvent = true;
@@ -818,13 +884,21 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     default:
       break;
   }
+  portEXIT_CRITICAL(&g_wifiEventMux);
 }
 
 void handleWifiEvents() {
-  if (g_wifiDisconnectedEvent) {
-    g_wifiDisconnectedEvent = false;
+  // WiFi events arrive on another FreeRTOS task. Drain a consistent snapshot
+  // so an event arriving during cleanup cannot be accidentally cleared.
+  portENTER_CRITICAL(&g_wifiEventMux);
+  const bool disconnected = g_wifiDisconnectedEvent;
+  const bool gotIp = g_wifiGotIpEvent;
+  const uint8_t reason = g_wifiDisconnectReason;
+  g_wifiDisconnectedEvent = false;
+  g_wifiGotIpEvent = false;
+  portEXIT_CRITICAL(&g_wifiEventMux);
+  if (disconnected) {
     ++g_wifiReconnectCount;
-    g_lastWifiAttemptMs = 0;
     g_otaActive = false;
     g_streamer.reset();
     g_rtspServer.end();
@@ -842,11 +916,10 @@ void handleWifiEvents() {
       g_mdnsReady = false;
     }
     g_networkServicesPending = false;
-    statusf("wifi disconnected reason=%u", g_wifiDisconnectReason);
+    statusf("wifi disconnected reason=%u", reason);
   }
 
-  if (g_wifiGotIpEvent) {
-    g_wifiGotIpEvent = false;
+  if (gotIp && WiFi.status() == WL_CONNECTED) {
     g_wifiAttemptCount = 0;
     g_lastWifiAttemptMs = 0;
     statusf("wifi ip=%s", WiFi.localIP().toString().c_str());
@@ -914,6 +987,7 @@ bool applySensorControl(
       delay(10);
       return true;
     }
+    feedLoopWDT();
     delay(25 * (attempt + 1));
   }
   statusf("sensor setting rejected key=%s value=%d", key, static_cast<int>(value));
@@ -1088,11 +1162,11 @@ SettingResult applySetting(const char *key, int value, bool &streamRebuildRequir
   } else if (strcmp(key, "timelapse_enabled") == 0 || strcmp(key, "server_capture_enabled") == 0) {
     const bool enabled = value != 0;
     if (enabled == dfrcapture::enabled()) return SettingResult::unchanged;
-    dfrcapture::setEnabled(enabled);
+    if (!dfrcapture::setEnabled(enabled)) return SettingResult::failed;
   } else if (strcmp(key, "timelapse_interval_seconds") == 0 || strcmp(key, "server_capture_interval_seconds") == 0) {
-    const uint32_t bounded = static_cast<uint32_t>(max(5, value));
+    const uint32_t bounded = static_cast<uint32_t>(clampValue(value, 5, 86400));
     if (bounded == dfrcapture::intervalSeconds()) return SettingResult::unchanged;
-    dfrcapture::setIntervalSeconds(bounded);
+    if (!dfrcapture::setIntervalSeconds(bounded)) return SettingResult::failed;
   } else {
     return SettingResult::unsupported;
   }
@@ -1135,7 +1209,11 @@ void applyControlPayload(const String &payload) {
     return;
   }
 
-  if (changed) saveControllerSettings();
+  if (changed && !saveControllerSettings()) {
+    failed = true;
+    if (failedSettings.length() > 0) failedSettings += ",";
+    failedSettings += "persistence";
+  }
   if (streamRebuildRequired) rebuildStreamer();
   if (failed) {
     const String message = "setting apply failed: " + failedSettings;
@@ -1154,17 +1232,21 @@ void applyTimelapsePayload(const String &payload) {
   extractPayloadToken(payload, "_request_id", requestId);
   int value = 0;
   bool changed = false;
+  bool success = true;
   if (extractPayloadInt(payload, "enabled", value)) {
-    dfrcapture::setEnabled(value != 0);
+    success = dfrcapture::setEnabled(value != 0) && success;
     changed = true;
   }
   if (extractPayloadInt(payload, "interval_seconds", value)) {
-    dfrcapture::setIntervalSeconds(static_cast<uint32_t>(max(5, value)));
+    success = dfrcapture::setIntervalSeconds(static_cast<uint32_t>(max(5, value))) && success;
     changed = true;
   }
   if (!changed) {
     setCommandResult("capture_set", requestId, "error", "no supported capture setting in payload");
     setError("no supported server capture setting in MQTT payload");
+  } else if (!success) {
+    setCommandResult("capture_set", requestId, "error", "saving capture settings failed");
+    setError("saving server capture settings failed");
   } else {
     clearError();
     setCommandResult("capture_set", requestId, "ok", "server capture settings applied");
@@ -1177,22 +1259,26 @@ void processMqttMessage(const String &topicText, const String &payloadText) {
   extractPayloadToken(payloadText, "_request_id", requestId);
 
   if (topicText == mqttTopic("cmd/start")) {
+    const bool wasEnabled = g_streamEnabled;
     g_streamEnabled = true;
-    saveControllerSettings();
-    rebuildStreamer();
-    clearError();
-    setCommandResult("start", requestId, "ok", "stream enabled");
+    const bool saved = saveControllerSettings();
+    if (!wasEnabled || g_streamer == nullptr) rebuildStreamer();
+    if (saved) clearError();
+    setCommandResult("start", requestId, saved ? "ok" : "partial",
+                     saved ? "stream enabled" : "stream enabled; saving settings failed");
     recordStatus("mqtt start command");
   } else if (topicText == mqttTopic("cmd/stop")) {
     g_streamEnabled = false;
-    saveControllerSettings();
+    const bool saved = saveControllerSettings();
     g_streamer.reset();
-    setCommandResult("stop", requestId, "ok", "stream disabled");
+    setCommandResult("stop", requestId, saved ? "ok" : "partial",
+                     saved ? "stream disabled" : "stream disabled; saving settings failed");
     recordStatus("mqtt stop command");
   } else if (topicText == mqttTopic("cmd/restart")) {
     setCommandResult("restart", requestId, "ok", "device rebooting");
     publishSimple("status/state", "restarting");
     publishStatus(true);
+    flushStatus();
     g_mqttClient.loop();
     delay(100);
     ESP.restart();
@@ -1209,8 +1295,9 @@ void processMqttMessage(const String &topicText, const String &payloadText) {
       setCommandResult("capture_start", requestId, "ok", "server capture requested");
     }
   } else if (topicText == mqttTopic("cmd/timelapse/stop")) {
-    dfrcapture::setEnabled(false);
-    setCommandResult("capture_stop", requestId, "ok", "server capture disabled");
+    const bool saved = dfrcapture::setEnabled(false);
+    setCommandResult("capture_stop", requestId, saved ? "ok" : "error",
+                     saved ? "server capture disabled" : "saving capture settings failed");
   } else if (topicText == mqttTopic("cmd/timelapse/set")) {
     applyTimelapsePayload(payloadText);
   }
@@ -1218,24 +1305,30 @@ void processMqttMessage(const String &topicText, const String &payloadText) {
 }
 
 void mqttCallback(char *topic, byte *payload, unsigned int length) {
-  const String topicText(topic);
-  String payloadText;
-  payloadText.reserve(length + 1);
-  for (unsigned int index = 0; index < length; ++index) payloadText += static_cast<char>(payload[index]);
-  Serial.printf("[MQTT] %s: %s\n", topicText.c_str(), payloadText.c_str());
-  g_pendingMqttTopic = topicText;
-  g_pendingMqttPayload = payloadText;
-  g_pendingMqttMessage = true;
+  if (length > 1536 || strlen(topic) > 192 ||
+      g_pendingMqttCount == g_pendingMqttMessages.size()) {
+    ++g_mqttCommandDrops;
+    return;
+  }
+  PendingMqttMessage &message = g_pendingMqttMessages[
+      (g_pendingMqttHead + g_pendingMqttCount) % g_pendingMqttMessages.size()];
+  message.topic = topic;
+  message.payload = "";
+  if (message.topic.length() != strlen(topic) ||
+      !message.payload.concat(reinterpret_cast<const char *>(payload), length)) {
+    ++g_mqttCommandDrops;
+    return;
+  }
+  ++g_pendingMqttCount;
 }
 
 void handlePendingMqttMessage() {
-  if (!g_pendingMqttMessage) return;
-  const String topic = g_pendingMqttTopic;
-  const String payload = g_pendingMqttPayload;
-  g_pendingMqttMessage = false;
-  g_pendingMqttTopic = "";
-  g_pendingMqttPayload = "";
-  processMqttMessage(topic, payload);
+  if (g_pendingMqttCount == 0) return;
+  PendingMqttMessage message = std::move(g_pendingMqttMessages[g_pendingMqttHead]);
+  g_pendingMqttHead = (g_pendingMqttHead + 1) % g_pendingMqttMessages.size();
+  --g_pendingMqttCount;
+  Serial.printf("[MQTT] %s (%u bytes)\n", message.topic.c_str(), message.payload.length());
+  processMqttMessage(message.topic, message.payload);
 }
 
 void ensureMqtt() {
@@ -1261,13 +1354,10 @@ void ensureMqtt() {
 
   g_mqttClient.disconnect();
   g_mqttSocket.stop();
-  delay(5);
+  // PubSubClient's timeout only covers MQTT packets. WiFiClient uses seconds
+  // here and applies this limit to the TCP connection as well.
+  g_mqttSocket.setTimeout(1);
 
-  g_mqttClient.setServer(dfrcfg::kMqttHost, dfrcfg::kMqttPort);
-  g_mqttClient.setCallback(mqttCallback);
-  g_mqttClient.setSocketTimeout(1);
-  g_mqttClient.setKeepAlive(20);
-  g_mqttClient.setBufferSize(2048);
   const String willTopic = mqttTopic("status/online");
   bool connected = false;
   if (strlen(dfrcfg::kMqttUsername) > 0) {
@@ -1291,6 +1381,7 @@ void ensureMqtt() {
   g_mqttAttemptCount = 0;
   if (g_mqttEverConnected) ++g_mqttReconnectCount;
   g_mqttEverConnected = true;
+  g_mqttSocket.setNoDelay(true);
 
   g_mqttClient.subscribe(mqttTopic("cmd/start").c_str(), 1);
   g_mqttClient.subscribe(mqttTopic("cmd/stop").c_str(), 1);
@@ -1384,7 +1475,7 @@ void setupController() {
 
   Wire.begin(DFR_CAM_SIOD, DFR_CAM_SIOC, 100000);
 
-  g_preferences.begin("dfrcam", false);
+  g_preferencesReady = g_preferences.begin("dfrcam", false);
   loadControllerSettings();
   initCamera();
   configureLightSensor();
@@ -1402,7 +1493,13 @@ void setupController() {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.onEvent(onWifiEvent);
+  g_mqttClient.setServer(dfrcfg::kMqttHost, dfrcfg::kMqttPort);
+  g_mqttClient.setCallback(mqttCallback);
+  g_mqttClient.setSocketTimeout(1);
+  g_mqttClient.setKeepAlive(20);
+  if (!g_mqttClient.setBufferSize(2048)) setError("MQTT buffer allocation failed");
   enableLoopWDT();
+  g_loopWdtReady = true;
   ensureWifi();
 }
 
@@ -1425,6 +1522,7 @@ void loopController() {
   handleLightSensor();
   handleRtspLoop();
   updateRuntimeStats();
+  flushStatus();
   delay(1);
 }
 

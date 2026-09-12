@@ -7,6 +7,7 @@
 namespace {
 
 Preferences g_preferences;
+bool g_preferencesReady = false;
 bool g_enabled = true;
 uint32_t g_intervalSeconds = dfrcfg::kDefaultTimelapseIntervalSeconds;
 
@@ -16,7 +17,12 @@ namespace dfrcapture {
 
 bool begin() {
   // Keep the old NVS namespace so existing interval and limit settings survive the rename.
-  g_preferences.begin("dfrtime", false);
+  if (g_preferencesReady) return true;
+  g_preferencesReady = g_preferences.begin("dfrtime", false);
+  if (!g_preferencesReady) {
+    Serial.println("[CAPTURE] settings storage unavailable");
+    return false;
+  }
   g_enabled = g_preferences.getBool("enabled", true);
   g_intervalSeconds = constrain(
       g_preferences.getUInt("interval", dfrcfg::kDefaultTimelapseIntervalSeconds),
@@ -27,14 +33,19 @@ bool begin() {
 }
 
 bool setEnabled(bool enabledValue) {
+  if (!g_preferencesReady) return false;
+  if (g_enabled == enabledValue) return true;
+  if (g_preferences.putBool("enabled", enabledValue) != sizeof(uint8_t)) return false;
   g_enabled = enabledValue;
-  g_preferences.putBool("enabled", g_enabled);
   return true;
 }
 
 bool setIntervalSeconds(uint32_t interval) {
-  g_intervalSeconds = constrain(interval, 5UL, 86400UL);
-  g_preferences.putUInt("interval", g_intervalSeconds);
+  if (!g_preferencesReady) return false;
+  const uint32_t bounded = constrain(interval, 5UL, 86400UL);
+  if (g_intervalSeconds == bounded) return true;
+  if (g_preferences.putUInt("interval", bounded) != sizeof(uint32_t)) return false;
+  g_intervalSeconds = bounded;
   return true;
 }
 

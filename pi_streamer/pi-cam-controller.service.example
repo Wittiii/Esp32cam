@@ -8,7 +8,11 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/Esp32cam
 ExecStart=/home/pi/Esp32cam/.venv/bin/python /home/pi/Esp32cam/pi_streamer/pi_cam_controller.py --config /home/pi/Esp32cam/pi_streamer/config.json --autostart
-Restart=always
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=50
+Restart=on-failure
 RestartSec=3
 
 [Install]

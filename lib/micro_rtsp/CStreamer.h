@@ -10,6 +10,7 @@ class CRtspSession;
 class CStreamer
 {
 public:
+    static constexpr int kMaxSessions = 4;
     CStreamer( u_short width, u_short height );
     virtual ~CStreamer();
 
@@ -59,6 +60,7 @@ private:
 
     LinkedListElement m_Clients;
     uint32_t m_prevMsec;
+    bool m_timestampInitialized;
 
     int m_udpRefCount;
     bool m_nonBlockingTcpWrites;
@@ -76,8 +78,3 @@ private:
 // returns true if the file seems to be valid jpeg
 // If quant tables can be found they will be stored in qtable0/1
 bool decodeJPEGfile(BufPtr *start, uint32_t *len, BufPtr *qtable0, BufPtr *qtable1);
-bool findJPEGheader(BufPtr *start, uint32_t *len, uint8_t marker);
-
-// Given a jpeg ptr pointing to a pair of length bytes, advance the pointer to
-// the next 0xff marker byte
-void nextJpegBlock(BufPtr *start);

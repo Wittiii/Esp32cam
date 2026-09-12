@@ -1,10 +1,9 @@
 #pragma once
 
 #include <Arduino.h>
-#include <cctype>
 #include <esp_camera.h>
-#include <limits.h>
-#include <stdlib.h>
+
+#include "control_payload.h"
 
 namespace camcommon {
 
@@ -61,36 +60,11 @@ inline String rtspUrl(const IPAddress &address, uint16_t port, const char *prese
 }
 
 inline bool extractPayloadToken(const String &payload, const char *key, String &token) {
-  const String jsonKey = "\"" + String(key) + "\"";
-  int keyPosition = payload.indexOf(jsonKey);
-  if (keyPosition >= 0) {
-    const int colon = payload.indexOf(':', keyPosition + jsonKey.length());
-    if (colon < 0) return false;
-    int start = colon + 1;
-    while (start < payload.length() && isspace(static_cast<unsigned char>(payload[start]))) ++start;
-    if (start >= payload.length()) return false;
-    if (payload[start] == '"') {
-      const int end = payload.indexOf('"', start + 1);
-      if (end < 0) return false;
-      token = payload.substring(start + 1, end);
-      return true;
-    }
-    int end = start;
-    while (end < payload.length() && payload[end] != ',' && payload[end] != '}') ++end;
-    token = payload.substring(start, end);
-    token.trim();
-    return token.length() > 0;
-  }
-
-  const String legacyKey = String(key) + "=";
-  keyPosition = payload.indexOf(legacyKey);
-  if (keyPosition < 0) return false;
-  const int start = keyPosition + legacyKey.length();
-  int end = payload.indexOf(';', start);
-  if (end < 0) end = payload.length();
-  token = payload.substring(start, end);
-  token.trim();
-  return token.length() > 0;
+  controlpayload::Token field;
+  if (!controlpayload::find(payload.c_str(), payload.length(), key, field)) return false;
+  token = "";
+  if (!token.reserve(static_cast<unsigned int>(field.end - field.begin))) return false;
+  return controlpayload::decode(field, [&](char c) { return token.concat(c) != 0; });
 }
 
 inline bool extractPayloadInt(const String &payload, const char *key, int &value) {
@@ -99,15 +73,7 @@ inline bool extractPayloadInt(const String &payload, const char *key, int &value
   token.toLowerCase();
   if (token == "true" || token == "on") value = 1;
   else if (token == "false" || token == "off") value = 0;
-  else {
-    char *end = nullptr;
-    const long parsed = strtol(token.c_str(), &end, 10);
-    while (end != nullptr && *end != '\0' && isspace(static_cast<unsigned char>(*end))) ++end;
-    if (end == token.c_str() || end == nullptr || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
-      return false;
-    }
-    value = static_cast<int>(parsed);
-  }
+  else return controlpayload::parseInteger(token.c_str(), value);
   return true;
 }
 

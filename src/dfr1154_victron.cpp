@@ -113,6 +113,12 @@ uint8_t g_encryptionKey[kKeyLength] = {};
 char g_normalizedTargetMac[
     kMacHexLength + 1] = {};
 
+// NimBLE stores address bytes least-significant first. Compare the bytes directly
+// so unrelated advertisements do not allocate a temporary MAC string.
+uint8_t g_targetMacBytes[kMacHexLength / 2] = {};
+bool g_configurationLoaded = false;
+bool g_firstReadingPending = false;
+
 uint16_t g_lastNonce = 0;
 
 uint32_t g_initializedAtMs = 0;
@@ -359,24 +365,16 @@ bool normalizeMac(
 
 
 bool hasValidConfiguration() {
-
-  uint8_t ignoredKey[
-      kKeyLength];
-
-  char ignoredMac[
-      kMacHexLength + 1];
-
-  return
-      dfrcfg::kVictronEnabled &&
-
-      parseEncryptionKey(
-          dfrcfg::
-              kVictronEncryptionKey,
-          ignoredKey) &&
-
-      normalizeMac(
-          dfrcfg::kVictronMac,
-          ignoredMac);
+  // Configuration is immutable for this firmware. reading()/status() run often;
+  // do not parse the key and address on every camera/MQTT loop iteration.
+  static const bool configured = []() {
+    uint8_t ignoredKey[kKeyLength];
+    char ignoredMac[kMacHexLength + 1];
+    return dfrcfg::kVictronEnabled &&
+        parseEncryptionKey(dfrcfg::kVictronEncryptionKey, ignoredKey) &&
+        normalizeMac(dfrcfg::kVictronMac, ignoredMac);
+  }();
+  return configured;
 }
 
 
@@ -570,8 +568,16 @@ bool decodeSolarAdvertisement(
           plaintext + 10) &
       0x01FF;
 
+  // Victron uses all-ones sentinels for unavailable yield and PV power. They
+  // must not become 655350 Wh / 65535 W in the Pi's retained energy history.
+  // Like unavailable voltage/current, reject an incomplete core measurement;
+  // keep the previous reading and its original freshness timestamp.
+  const uint16_t yieldRaw = readLe16(plaintext + 6);
+  const uint16_t panelPowerRaw = readLe16(plaintext + 8);
 
-  if (!isfinite(
+
+  if (yieldRaw == 0xFFFF || panelPowerRaw == 0xFFFF ||
+      !isfinite(
           batteryVoltage) ||
 
       batteryVoltage < 0.0f ||
@@ -591,15 +597,11 @@ bool decodeSolarAdvertisement(
   }
 
 
-  bool firstReading = false;
-
-
   portENTER_CRITICAL(
       &g_readingMux);
 
 
-  firstReading =
-      !g_reading.valid;
+  g_firstReadingPending = g_firstReadingPending || !g_reading.valid;
 
 
   g_reading.valid =
@@ -623,14 +625,11 @@ bool decodeSolarAdvertisement(
 
 
   g_reading.yieldTodayWh =
-      readLe16(
-          plaintext + 6) *
-      10UL;
+      yieldRaw * 10UL;
 
 
   g_reading.panelPower =
-      readLe16(
-          plaintext + 8);
+      panelPowerRaw;
 
 
   g_reading.loadCurrent =
@@ -664,13 +663,6 @@ bool decodeSolarAdvertisement(
   g_lastNonce = nonce;
 
   g_haveNonce = true;
-
-
-  if (firstReading) {
-
-    Serial.println(
-        "[Victron] first valid SmartSolar advertisement received");
-  }
 
 
   return true;
@@ -748,23 +740,8 @@ void recordInitFailure(
 
 bool addressMatches(
     const NimBLEAddress &address) {
-
-  char normalized[
-      kMacHexLength + 1];
-
-
-  return
-      normalizeMac(
-          address
-              .toString()
-              .c_str(),
-
-          normalized) &&
-
-      strcmp(
-          normalized,
-          g_normalizedTargetMac) ==
-          0;
+  return memcmp(address.getVal(), g_targetMacBytes,
+                sizeof(g_targetMacBytes)) == 0;
 }
 
 
@@ -787,32 +764,26 @@ void processAdvertisement(
   }
 
 
-  if (!device->
-          haveManufacturerData()) {
-
-    return;
+  // Read AD structures in-place: manufacturer strings otherwise allocate on
+  // each packet. Bounds also cover malformed/truncated advertising data.
+  const auto &payload = device->getPayload();
+  for (size_t offset = 0; offset < payload.size();) {
+    const size_t fieldLength = payload[offset];
+    if (fieldLength == 0) {
+      break;
+    }
+    if (fieldLength > payload.size() - offset - 1) {
+      recordDecodeError();
+      break;
+    }
+    if (payload[offset + 1] == 0xFF &&
+        decodeSolarAdvertisement(payload.data() + offset + 2,
+                                 fieldLength - 1,
+                                 static_cast<int8_t>(device->getRSSI()))) {
+      break;
+    }
+    offset += fieldLength + 1;
   }
-
-
-  const std::string
-      manufacturerData =
-          device->
-              getManufacturerData();
-
-
-  decodeSolarAdvertisement(
-
-      reinterpret_cast<
-          const uint8_t *>(
-          manufacturerData
-              .data()),
-
-      manufacturerData
-          .size(),
-
-      static_cast<int8_t>(
-          device->
-              getRSSI()));
 }
 
 
@@ -911,8 +882,10 @@ void softRecoverScanner(
 
 
   if (g_scan->isScanning()) {
-
-    g_scan->stop();
+    if (!g_scan->stop()) {
+      recordInitFailure("NimBLE scanner stop failed during recovery");
+      return;
+    }
   }
 
 
@@ -1011,22 +984,22 @@ void begin() {
   }
 
 
-  if (!parseEncryptionKey(
-          dfrcfg::
-              kVictronEncryptionKey,
+  if (!g_configurationLoaded) {
+    if (!parseEncryptionKey(dfrcfg::kVictronEncryptionKey, g_encryptionKey) ||
+        !normalizeMac(dfrcfg::kVictronMac, g_normalizedTargetMac)) {
+      recordInitFailure("device configuration rejected");
+      return;
+    }
 
-          g_encryptionKey) ||
-
-      !normalizeMac(
-          dfrcfg::
-              kVictronMac,
-
-          g_normalizedTargetMac)) {
-
-    recordInitFailure(
-        "device configuration rejected");
-
-    return;
+    for (size_t index = 0; index < sizeof(g_targetMacBytes); ++index) {
+      const size_t hexOffset = (sizeof(g_targetMacBytes) - index - 1) * 2;
+      g_targetMacBytes[index] = static_cast<uint8_t>(
+          (hexNibble(g_normalizedTargetMac[hexOffset]) << 4) |
+          hexNibble(g_normalizedTargetMac[hexOffset + 1]));
+    }
+    // Never rewrite the address/key while the NimBLE callback could use them
+    // during a scanner initialization retry.
+    g_configurationLoaded = true;
   }
 
 
@@ -1286,8 +1259,9 @@ void begin() {
 // ============================================================================
 
 void loop() {
+  const Reading current = reading();
 
-  if (!g_reading.initialized) {
+  if (!current.initialized) {
 
     if (g_startRequested) {
       begin();
@@ -1297,12 +1271,18 @@ void loop() {
   }
 
 
-  const uint32_t now =
-      millis();
+  // Take the timestamp AFTER the snapshot. The BLE task can publish a reading
+  // concurrently; now - a newer lastUpdateMs would underflow to ~49 days.
+  const uint32_t now = millis();
 
-
-  const Reading current =
-      reading();
+  portENTER_CRITICAL(&g_readingMux);
+  const bool firstReadingPending = g_firstReadingPending;
+  g_firstReadingPending = false;
+  portEXIT_CRITICAL(&g_readingMux);
+  if (firstReadingPending) {
+    // Serial output belongs to the loop task, never the BLE host callback.
+    Serial.println("[Victron] first valid SmartSolar advertisement received");
+  }
 
 
   const bool
@@ -1346,13 +1326,16 @@ void loop() {
   portENTER_CRITICAL(
       &g_readingMux);
 
+  // The soft scan restart above can yield to the BLE task. Read time again
+  // under the same lock as lastUpdateMs before deciding to reboot the camera.
+  const uint32_t recoveryNow = millis();
 
   const bool
       dataStaleForRecovery =
 
           g_reading.valid &&
 
-          now -
+          recoveryNow -
                   g_reading.lastUpdateMs >=
               dfrcfg::
                   kVictronRecoveryRebootAfterMs;
@@ -1365,7 +1348,7 @@ void loop() {
 
           g_initializedAtMs != 0 &&
 
-          now -
+          recoveryNow -
                   g_initializedAtMs >=
               dfrcfg::
                   kVictronRecoveryRebootAfterMs;

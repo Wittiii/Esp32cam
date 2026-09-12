@@ -12,6 +12,8 @@ enum RTSP_CMD_TYPES
     RTSP_SETUP,
     RTSP_PLAY,
     RTSP_TEARDOWN,
+    RTSP_PAUSE,
+    RTSP_GET_PARAMETER,
     RTSP_UNKNOWN
 };
 
@@ -38,15 +40,24 @@ public:
     bool m_streaming;
     bool m_stopped;
 
-    void InitTransport(u_short aRtpPort, u_short aRtcpPort);
+    bool InitTransport(u_short aRtpPort, u_short aRtcpPort);
 
     bool isTcpTransport() { return m_TcpTransport; }
     SOCKET& getClient() { return m_RtspClient; }
     
     uint16_t getRtpClientPort() { return m_RtpClientPort; }
+    uint8_t getRtpChannel() const { return m_RtpChannel; }
 
     bool debug; /// set to true to get a load of output
 private:
+    bool m_UdpInitialized = false;
+    bool m_transportReady = false;
+    uint8_t m_RtpChannel = 0;
+    uint8_t m_RtcpChannel = 1;
+    uint32_t m_partialStartedAt = 0;
+    uint32_t m_connectedAt = 0;
+    size_t m_interleavedRemaining = 0;
+    void sendSimpleResponse(unsigned status, const char *reason);
     enum HeaderState { headerUnknown, headerGotMethod, headerInvalid };
 
     void newCommandInit();
