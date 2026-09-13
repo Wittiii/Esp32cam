@@ -19,6 +19,7 @@ def main():
                      "lib/micro_rtsp/CStreamer.cpp", "lib/micro_rtsp/CRtspSession.cpp"],
             "victron": ["-Itest/native/victron_stubs", "-Iinclude", "test/native/test_victron.cpp"],
             "control_payload": ["-Iinclude", "test/native/test_control_payload.cpp"],
+            "camera_gain": ["-Iinclude", "test/native/test_camera_gain.cpp"],
             "server_capture": ["-Itest/native/capture_stubs", "-Iinclude", "test/native/test_server_capture.cpp",
                                "src/dfr1154_server_capture.cpp"],
         }

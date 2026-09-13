@@ -32,6 +32,8 @@ small hardware stubs. It checks fragmented/pipelined RTSP, RTCP interleaving,
 input bounds, JPEG truncation, slow/disconnected clients, RTP timestamps/table
 headers, UDP ownership, control payload parsing, NVS failures/no-op writes and
 BLE timing/sentinel values. The Victron AES stub does not validate cryptography.
+The OV3660 gain tests cover index-to-register conversion, invalid inputs and
+one-time settings migration, including write failures and later user choices.
 
 ## Firmware build (no upload)
 
