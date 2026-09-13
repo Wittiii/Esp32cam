@@ -25,6 +25,7 @@
 
 #include "camera_common.h"
 #include "bounded_mqtt_socket.h"
+#include "mqtt_status_batch.h"
 #include "dfr1154_camera_gain.h"
 #include "dfr1154_config.h"
 #include "dfr1154_environment.h"
@@ -57,6 +58,20 @@ bool g_mqttEverConnected = false;
 bool g_victronBeginAttempted = false;
 bool g_statusPublishPending = false;
 bool g_configPublishPending = false;
+// One bounded snapshot, never a growing history of status packets.
+MqttStatusBatch<String, 96> g_statusBatch(12 * 1024);
+bool g_statusBatchBuildFailed = false;
+bool g_statusBatchHasConfig = false;
+bool g_statusBatchHasBme = false;
+String g_statusBatchConfig;
+String g_previousStatusConfig;
+bool g_statusSendStarted = false;
+uint32_t g_lastStatusSendMs = 0;
+bool g_bmePublishScheduleStarted = false;
+uint32_t g_lastBmePublishMs = 0;
+bool g_mqttSessionActive = false;
+uint32_t g_mqttConnectedAtMs = 0;
+size_t g_nextMqttSubscription = 0;
 bool g_preferencesReady = false;
 bool g_loopWdtReady = false;
 
@@ -116,6 +131,10 @@ uint32_t g_wifiReconnectCount = 0;
 uint32_t g_mqttReconnectCount = 0;
 uint32_t g_cameraRecoveryCount = 0;
 uint32_t g_mqttPublishFailures = 0;
+uint32_t g_mqttSubscribeFailures = 0;
+uint32_t g_statusBatchFailures = 0;
+int g_lastMqttDisconnectState = 0;
+const char *g_lastMqttFailurePhase = "none";
 uint32_t g_wifiAttemptCount = 0;
 uint32_t g_mqttAttemptCount = 0;
 uint8_t g_cameraRecoveryFailures = 0;
@@ -217,6 +236,11 @@ const char *resetReasonName(esp_reset_reason_t reason) {
     case ESP_RST_SDIO: return "sdio";
     default: return "unknown";
   }
+}
+
+// Called only by the socket's bounded write wait: never re-enter MQTT or OTA.
+void serviceMqttWriteWait() {
+  if (g_loopWdtReady) feedLoopWDT();
 }
 
 void serviceMqttDuringRtspWrite() {
@@ -363,6 +387,13 @@ bool publishSimple(const char *suffix, const String &value, bool retain = true) 
     feedLoopWDT();
     if (!g_mqttClient.publish(mqttTopic(suffix).c_str(), value.c_str(), retain)) {
       ++g_mqttPublishFailures;
+      g_lastMqttFailurePhase = "publish";
+      const auto &failure = g_mqttSocket.lastFailure();
+      statusf("mqtt publish failed topic=%s tx=%s errno=%d sent=%u/%u wait=%lums",
+              suffix, BoundedMqttSocket::reasonName(failure.reason),
+              failure.errorNumber, static_cast<unsigned>(failure.sentBytes),
+              static_cast<unsigned>(failure.totalBytes),
+              static_cast<unsigned long>(failure.elapsedMs));
       // A failed/partial packet must not be followed by more packets on the
       // same TCP stream; reconnect and resend retained status instead.
       g_mqttSocket.stop();
@@ -375,29 +406,33 @@ bool publishSimple(const char *suffix, const String &value, bool retain = true) 
   return false;
 }
 
-void publishExternalSensors() {
-  static bool bmePublishScheduleStarted = false;
-  static uint32_t lastBmePublishMs = 0;
-  const uint32_t now = millis();
-  if (!bmePublishScheduleStarted) {
-    bmePublishScheduleStarted = true;
-    lastBmePublishMs = now;
+void queueStatus(const char *suffix, const String &value) {
+  if (!g_statusBatchBuildFailed && !g_statusBatch.push(suffix, value)) {
+    g_statusBatchBuildFailed = true;
   }
-  if (now - lastBmePublishMs >= dfrcfg::kBme280PublishIntervalMs) {
-    lastBmePublishMs = now;
+}
+
+void queueExternalSensors() {
+  const uint32_t now = millis();
+  if (!g_bmePublishScheduleStarted) {
+    g_bmePublishScheduleStarted = true;
+    g_lastBmePublishMs = now;
+  }
+  if (now - g_lastBmePublishMs >= dfrcfg::kBme280PublishIntervalMs) {
+    g_statusBatchHasBme = true;
     dfrbme::Reading bme = dfrbme::reading();
     bme.valid = bme.valid && now - bme.lastUpdateMs < dfrcfg::kBme280StaleAfterMs;
-    publishSimple("status/bme280", dfrbme::status());
-    publishSimple("sensor/bme280/address", bme.address == 0 ? "-" : "0x" + String(bme.address, HEX));
-    publishSimple("sensor/bme280/temperature_c", bme.valid ? String(bme.temperatureC, 2) : "-");
-    publishSimple("sensor/bme280/humidity_percent", bme.valid ? String(bme.humidityPercent, 2) : "-");
-    publishSimple("sensor/bme280/pressure_hpa", bme.valid ? String(bme.pressureHpa, 2) : "-");
-    publishSimple("sensor/bme280/latest_temperature_c", bme.valid ? String(bme.latestTemperatureC, 2) : "-");
-    publishSimple("sensor/bme280/latest_humidity_percent", bme.valid ? String(bme.latestHumidityPercent, 2) : "-");
-    publishSimple("sensor/bme280/latest_pressure_hpa", bme.valid ? String(bme.latestPressureHpa, 2) : "-");
-    publishSimple("sensor/bme280/average_samples", String(bme.averageSamples));
-    publishSimple("sensor/bme280/read_failures", String(bme.readFailures));
-    publishSimple(
+    queueStatus("status/bme280", dfrbme::status());
+    queueStatus("sensor/bme280/address", bme.address == 0 ? "-" : "0x" + String(bme.address, HEX));
+    queueStatus("sensor/bme280/temperature_c", bme.valid ? String(bme.temperatureC, 2) : "-");
+    queueStatus("sensor/bme280/humidity_percent", bme.valid ? String(bme.humidityPercent, 2) : "-");
+    queueStatus("sensor/bme280/pressure_hpa", bme.valid ? String(bme.pressureHpa, 2) : "-");
+    queueStatus("sensor/bme280/latest_temperature_c", bme.valid ? String(bme.latestTemperatureC, 2) : "-");
+    queueStatus("sensor/bme280/latest_humidity_percent", bme.valid ? String(bme.latestHumidityPercent, 2) : "-");
+    queueStatus("sensor/bme280/latest_pressure_hpa", bme.valid ? String(bme.latestPressureHpa, 2) : "-");
+    queueStatus("sensor/bme280/average_samples", String(bme.averageSamples));
+    queueStatus("sensor/bme280/read_failures", String(bme.readFailures));
+    queueStatus(
         "sensor/bme280/age_seconds",
         bme.valid ? String((now - bme.lastUpdateMs) / 1000UL) : "-");
 
@@ -413,35 +448,35 @@ void publishExternalSensors() {
       bmeJson += ",\"average_samples\":" + String(bme.averageSamples);
     }
     bmeJson += "}";
-    publishSimple("sensor/bme280/json", bmeJson);
+    queueStatus("sensor/bme280/json", bmeJson);
   }
 
   dfrvictron::Reading victron = dfrvictron::reading();
   victron.valid = victron.valid &&
       millis() - victron.lastUpdateMs < dfrcfg::kVictronStaleAfterMs;
-  publishSimple("status/victron_ble", dfrvictron::status());
-  publishSimple(
+  queueStatus("status/victron_ble", dfrvictron::status());
+  queueStatus(
     "status/victron_ble_stage",
     dfrvictron::debugStage());
 
-publishSimple(
+queueStatus(
     "status/victron_ble_stage_code",
     String(dfrvictron::debugStageCode()));
-  publishSimple("victron/mppt/configured", victron.configured ? "true" : "false");
-  publishSimple("victron/mppt/restart_count", String(victron.restartCount));
-  publishSimple("victron/mppt/scan_restart_count", String(victron.scanRestartCount));
-  publishSimple("victron/mppt/advertisement_count", String(victron.advertisementCount));
-  publishSimple("victron/mppt/decode_error_count", String(victron.decodeErrorCount));
-  publishSimple("victron/mppt/charger_state", victron.valid ? dfrvictron::chargeStateName(victron.chargeState) : "-");
-  publishSimple("victron/mppt/charger_state_id", victron.valid ? String(victron.chargeState) : "-");
-  publishSimple("victron/mppt/error_code", victron.valid ? String(victron.errorCode) : "-");
-  publishSimple("victron/mppt/battery_voltage_v", victron.valid ? String(victron.batteryVoltage, 2) : "-");
-  publishSimple("victron/mppt/battery_current_a", victron.valid ? String(victron.batteryCurrent, 2) : "-");
-  publishSimple("victron/mppt/panel_power_w", victron.valid ? String(victron.panelPower, 0) : "-");
-  publishSimple("victron/mppt/yield_today_wh", victron.valid ? String(victron.yieldTodayWh) : "-");
-  publishSimple("victron/mppt/load_current_a", victron.valid ? String(victron.loadCurrent, 2) : "-");
-  publishSimple("victron/mppt/rssi", victron.valid ? String(victron.rssi) : "-");
-  publishSimple(
+  queueStatus("victron/mppt/configured", victron.configured ? "true" : "false");
+  queueStatus("victron/mppt/restart_count", String(victron.restartCount));
+  queueStatus("victron/mppt/scan_restart_count", String(victron.scanRestartCount));
+  queueStatus("victron/mppt/advertisement_count", String(victron.advertisementCount));
+  queueStatus("victron/mppt/decode_error_count", String(victron.decodeErrorCount));
+  queueStatus("victron/mppt/charger_state", victron.valid ? dfrvictron::chargeStateName(victron.chargeState) : "-");
+  queueStatus("victron/mppt/charger_state_id", victron.valid ? String(victron.chargeState) : "-");
+  queueStatus("victron/mppt/error_code", victron.valid ? String(victron.errorCode) : "-");
+  queueStatus("victron/mppt/battery_voltage_v", victron.valid ? String(victron.batteryVoltage, 2) : "-");
+  queueStatus("victron/mppt/battery_current_a", victron.valid ? String(victron.batteryCurrent, 2) : "-");
+  queueStatus("victron/mppt/panel_power_w", victron.valid ? String(victron.panelPower, 0) : "-");
+  queueStatus("victron/mppt/yield_today_wh", victron.valid ? String(victron.yieldTodayWh) : "-");
+  queueStatus("victron/mppt/load_current_a", victron.valid ? String(victron.loadCurrent, 2) : "-");
+  queueStatus("victron/mppt/rssi", victron.valid ? String(victron.rssi) : "-");
+  queueStatus(
       "victron/mppt/age_seconds",
       victron.valid ? String((millis() - victron.lastUpdateMs) / 1000UL) : "-");
 
@@ -462,7 +497,7 @@ publishSimple(
     victronJson += ",\"rssi\":" + String(victron.rssi);
   }
   victronJson += "}";
-  publishSimple("victron/mppt/json", victronJson);
+  queueStatus("victron/mppt/json", victronJson);
 }
 
 String buildConfigJson() {
@@ -517,59 +552,142 @@ String buildConfigJson() {
   return json;
 }
 
+void discardStatusBatch() {
+  g_statusBatch.clear();
+  g_statusBatchBuildFailed = false;
+  g_statusBatchHasConfig = false;
+  g_statusBatchHasBme = false;
+  g_statusBatchConfig = "";
+}
+
 void publishStatus(bool forceConfig) {
   g_statusPublishPending = true;
   g_configPublishPending = g_configPublishPending || forceConfig;
+  if (forceConfig) {
+    // A new command/reconnect supersedes an older snapshot. Never let its
+    // response wait behind a nearly full batch of obsolete telemetry.
+    discardStatusBatch();
+  }
 }
 
-void flushStatus() {
-  static String previousConfig;
-  if (!g_statusPublishPending || !g_mqttClient.connected()) return;
+String buildMqttDiagnostics() {
+  const auto &failure = g_mqttSocket.lastFailure();
+  String json;
+  json.reserve(768);
+  json = "{\"firmware\":\"" + String(dfrcfg::kFirmwareVersion) + "\"";
+  json += ",\"uptime_seconds\":" + String(millis() / 1000UL);
+  json += ",\"reset_reason\":\"" + String(resetReasonName(g_bootResetReason)) + "\"";
+  json += ",\"wifi_reconnects\":" + String(g_wifiReconnectCount);
+  json += ",\"mqtt_reconnects\":" + String(g_mqttReconnectCount);
+  json += ",\"publish_failures\":" + String(g_mqttPublishFailures);
+  json += ",\"subscribe_failures\":" + String(g_mqttSubscribeFailures);
+  json += ",\"status_queue_failures\":" + String(g_statusBatchFailures);
+  json += ",\"write_failures\":" + String(g_mqttSocket.failureCount());
+  json += ",\"last_phase\":\"" + String(g_lastMqttFailurePhase) + "\"";
+  json += ",\"last_disconnect_state\":" + String(g_lastMqttDisconnectState);
+  json += ",\"last_write_reason\":\"" + String(BoundedMqttSocket::reasonName(failure.reason)) + "\"";
+  json += ",\"last_write_errno\":" + String(failure.errorNumber);
+  json += ",\"last_write_ms\":" + String(failure.elapsedMs);
+  json += ",\"last_write_sent\":" + String(static_cast<unsigned>(failure.sentBytes));
+  json += ",\"last_write_total\":" + String(static_cast<unsigned>(failure.totalBytes));
+  json += "}";
+  return json;
+}
+
+void buildStatusBatch() {
   const bool forceConfig = g_configPublishPending;
   g_statusPublishPending = false;
   g_configPublishPending = false;
 
-  publishSimple("status/online", "true");
-  publishSimple("status/state", streamState());
-  publishSimple("status/error", g_lastError);
-  publishSimple("status/ip", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "-");
-  publishSimple("status/rtsp_url", rtspUrl());
-  publishSimple("status/mdns", String(dfrcfg::kMdnsHostname) + ".local");
-  publishSimple("status/last_status", g_lastStatus);
-  publishSimple("status/clients", String(directStreamingSessionCount()));
-  publishSimple("status/direct_sessions", String(directSessionCount()));
-  publishSimple("status/direct_streaming_clients", String(directStreamingSessionCount()));
-  publishSimple("status/frame_fps", String(g_lastMeasuredFps, 1));
-  publishSimple("status/configured_fps", String(g_streamFps));
-  publishSimple("status/mqtt_connected", "true");
-  publishSimple("status/wifi_rssi", String(WiFi.RSSI()));
-  publishSimple("status/uptime_seconds", String(millis() / 1000UL));
-  publishSimple("status/free_heap_bytes", String(ESP.getFreeHeap()));
-  publishSimple("status/min_free_heap_bytes", String(ESP.getMinFreeHeap()));
-  publishSimple("status/reset_reason", resetReasonName(g_bootResetReason));
-  publishSimple("status/firmware_version", dfrcfg::kFirmwareVersion);
-  publishSimple("status/wifi_reconnect_count", String(g_wifiReconnectCount));
-  publishSimple("status/mqtt_reconnect_count", String(g_mqttReconnectCount));
-  publishSimple("status/camera_recovery_count", String(g_cameraRecoveryCount));
-  publishSimple("status/mqtt_publish_failures", String(g_mqttPublishFailures));
-  publishSimple("status/mqtt_command_drops", String(g_mqttCommandDrops));
-  publishSimple("status/ambient_lux", isfinite(g_ambientLux) ? String(g_ambientLux, 2) : "-");
-  publishSimple("status/ir_mode", irModeName());
-  publishSimple("status/ir_enabled", g_irEnabled ? "true" : "false");
-  publishSimple("status/light_sensor", g_lightReady ? "ready" : "unavailable");
-  publishExternalSensors();
-  publishSimple("status/capture_request/state", dfrcapture::state());
-  publishSimple("status/capture_request/enabled", dfrcapture::enabled() ? "true" : "false");
-  publishSimple("status/capture_request/interval_seconds", String(dfrcapture::intervalSeconds()));
-  publishSimple("status/command/id", g_lastCommandId);
-  publishSimple("status/command/name", g_lastCommandName);
-  publishSimple("status/command/result", g_lastCommandResult);
-  publishSimple("status/command/message", g_lastCommandMessage);
-  publishSimple("status/command/at_ms", String(g_lastCommandAtMs));
+  queueStatus("status/online", "true");
+  // Send the small diagnostic snapshot before the regular status/sensor batch.
+  queueStatus("status/mqtt_diagnostics", buildMqttDiagnostics());
+  queueStatus("status/command/id", g_lastCommandId);
+  queueStatus("status/command/name", g_lastCommandName);
+  queueStatus("status/command/result", g_lastCommandResult);
+  queueStatus("status/command/message", g_lastCommandMessage);
+  queueStatus("status/command/at_ms", String(g_lastCommandAtMs));
+  queueStatus("status/state", streamState());
+  queueStatus("status/error", g_lastError);
+  queueStatus("status/ip", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "-");
+  queueStatus("status/rtsp_url", rtspUrl());
+  queueStatus("status/mdns", String(dfrcfg::kMdnsHostname) + ".local");
+  queueStatus("status/last_status", g_lastStatus);
+  queueStatus("status/clients", String(directStreamingSessionCount()));
+  queueStatus("status/direct_sessions", String(directSessionCount()));
+  queueStatus("status/direct_streaming_clients", String(directStreamingSessionCount()));
+  queueStatus("status/frame_fps", String(g_lastMeasuredFps, 1));
+  queueStatus("status/configured_fps", String(g_streamFps));
+  queueStatus("status/mqtt_connected", "true");
+  queueStatus("status/wifi_rssi", String(WiFi.RSSI()));
+  queueStatus("status/uptime_seconds", String(millis() / 1000UL));
+  queueStatus("status/free_heap_bytes", String(ESP.getFreeHeap()));
+  queueStatus("status/min_free_heap_bytes", String(ESP.getMinFreeHeap()));
+  queueStatus("status/reset_reason", resetReasonName(g_bootResetReason));
+  queueStatus("status/firmware_version", dfrcfg::kFirmwareVersion);
+  queueStatus("status/wifi_reconnect_count", String(g_wifiReconnectCount));
+  queueStatus("status/mqtt_reconnect_count", String(g_mqttReconnectCount));
+  queueStatus("status/camera_recovery_count", String(g_cameraRecoveryCount));
+  queueStatus("status/mqtt_publish_failures", String(g_mqttPublishFailures));
+  queueStatus("status/mqtt_command_drops", String(g_mqttCommandDrops));
+  queueStatus("status/ambient_lux", isfinite(g_ambientLux) ? String(g_ambientLux, 2) : "-");
+  queueStatus("status/ir_mode", irModeName());
+  queueStatus("status/ir_enabled", g_irEnabled ? "true" : "false");
+  queueStatus("status/light_sensor", g_lightReady ? "ready" : "unavailable");
+  queueExternalSensors();
+  queueStatus("status/capture_request/state", dfrcapture::state());
+  queueStatus("status/capture_request/enabled", dfrcapture::enabled() ? "true" : "false");
+  queueStatus("status/capture_request/interval_seconds", String(dfrcapture::intervalSeconds()));
 
   const String config = buildConfigJson();
-  if (forceConfig || config != previousConfig) {
-    if (publishSimple("status/config", config)) previousConfig = config;
+  if (forceConfig || config != g_previousStatusConfig) {
+    queueStatus("status/config", config);
+    g_statusBatchConfig = config;
+    g_statusBatchHasConfig = true;
+    if (g_statusBatchConfig.length() != config.length()) g_statusBatchBuildFailed = true;
+  }
+  if (g_statusBatchBuildFailed) {
+    ++g_statusBatchFailures;
+    g_lastMqttFailurePhase = "status_queue";
+    discardStatusBatch();
+    g_statusPublishPending = true;
+    g_configPublishPending = true;
+    statusf("mqtt status batch allocation/capacity failure count=%lu",
+            static_cast<unsigned long>(g_statusBatchFailures));
+  }
+}
+
+// At most two small MQTT packets per pass, with a pause between passes.
+// The main loop continues servicing OTA, camera, IR and BLE between them.
+void flushStatus() {
+  if (g_otaActive || !g_mqttClient.connected()) return;
+  const uint32_t now = millis();
+  if (g_statusSendStarted && now - g_lastStatusSendMs < 20UL) return;
+  g_statusSendStarted = true;
+  g_lastStatusSendMs = now;
+
+  if (g_statusBatch.empty()) {
+    if (!g_statusPublishPending) return;
+    buildStatusBatch();
+  }
+  for (unsigned sent = 0; sent < 2 && !g_statusBatch.empty(); ++sent) {
+    const auto *message = g_statusBatch.front();
+    if (!publishSimple(message->suffix, message->value)) {
+      discardStatusBatch();
+      g_statusPublishPending = true;
+      g_configPublishPending = true;
+      return;
+    }
+    g_statusBatch.pop();
+    // Safe here: outside PubSubClient's write/callback. Receive SUBACKs,
+    // commands and keepalive replies instead of only filling the TX queue.
+    g_mqttClient.loop();
+    if (!g_mqttClient.connected()) return;
+    if (g_statusBatch.empty()) {
+      if (g_statusBatchHasConfig) g_previousStatusConfig = g_statusBatchConfig;
+      if (g_statusBatchHasBme) g_lastBmePublishMs = millis();
+      discardStatusBatch();
+    }
   }
 }
 
@@ -855,8 +973,9 @@ void configureOta() {
     g_otaActive = true;
     g_streamer.reset();
     recordStatus("ota update started; camera stream suspended");
+    // MQTT trouble must never block starting an OTA recovery upload.
+    discardStatusBatch();
     publishStatus();
-    flushStatus();
   });
   ArduinoOTA.onEnd([]() { recordStatus("ota update finished"); });
   ArduinoOTA.onProgress([](unsigned int, unsigned int) { feedLoopWDT(); });
@@ -1289,9 +1408,17 @@ void processMqttMessage(const String &topicText, const String &payloadText) {
     recordStatus("mqtt stop command");
   } else if (topicText == mqttTopic("cmd/restart")) {
     setCommandResult("restart", requestId, "ok", "device rebooting");
+    // Publish only the restart acknowledgement before reboot, not a full
+    // sensor snapshot. Other command responses use the priority batch.
     publishSimple("status/state", "restarting");
-    publishStatus(true);
-    flushStatus();
+    const char *replyTopics[] = {"status/command/id", "status/command/name",
+                                "status/command/result", "status/command/message"};
+    const String *replyValues[] = {&g_lastCommandId, &g_lastCommandName,
+                                  &g_lastCommandResult, &g_lastCommandMessage};
+    for (size_t index = 0; index < 4; ++index) {
+      if (!publishSimple(replyTopics[index], *replyValues[index])) break;
+      g_mqttClient.loop();
+    }
     g_mqttClient.loop();
     delay(100);
     ESP.restart();
@@ -1348,17 +1475,46 @@ void ensureMqtt() {
   if (WiFi.status() != WL_CONNECTED) {
     if (g_mqttClient.connected()) g_mqttClient.disconnect();
     g_mqttSocket.stop();
+    g_mqttSessionActive = false;
+    discardStatusBatch();
     g_mqttAttemptCount = 0;
     g_lastMqttAttemptMs = 0;
     return;
   }
   g_mqttClient.loop();
+  const uint32_t now = millis();
   if (g_mqttClient.connected()) {
-    g_mqttAttemptCount = 0;
+    // Reset backoff only after a stable session, not after each brief CONNECT.
+    if (now - g_mqttConnectedAtMs >= 10000UL) g_mqttAttemptCount = 0;
+    static const char *subscriptions[] = {
+        "cmd/start", "cmd/stop", "cmd/restart", "cmd/ping", "cmd/set",
+        "cmd/timelapse/start", "cmd/timelapse/stop", "cmd/timelapse/set"};
+    if (g_nextMqttSubscription < sizeof(subscriptions) / sizeof(subscriptions[0])) {
+      const char *suffix = subscriptions[g_nextMqttSubscription];
+      feedLoopWDT();
+      if (!g_mqttClient.subscribe(mqttTopic(suffix).c_str(), 1)) {
+        ++g_mqttSubscribeFailures;
+        g_lastMqttFailurePhase = "subscribe";
+        statusf("mqtt subscribe failed topic=%s", suffix);
+        g_mqttSocket.stop();
+        return;
+      }
+      ++g_nextMqttSubscription;
+      g_mqttClient.loop();
+    }
     return;
   }
 
-  const uint32_t now = millis();
+  if (g_mqttSessionActive) {
+    g_mqttSessionActive = false;
+    g_lastMqttDisconnectState = g_mqttClient.state();
+    g_lastMqttAttemptMs = now;
+    discardStatusBatch();
+    const auto &failure = g_mqttSocket.lastFailure();
+    statusf("mqtt disconnected rc=%d tx=%s errno=%d",
+            g_lastMqttDisconnectState, BoundedMqttSocket::reasonName(failure.reason),
+            failure.errorNumber);
+  }
   const uint32_t retryDelay = boundedReconnectDelay(
       g_mqttAttemptCount, dfrcfg::kMqttRetryInitialMs, dfrcfg::kMqttRetryMaxMs);
   if (g_lastMqttAttemptMs != 0 && now - g_lastMqttAttemptMs < retryDelay) return;
@@ -1367,9 +1523,10 @@ void ensureMqtt() {
 
   g_mqttClient.disconnect();
   g_mqttSocket.stop();
-  // PubSubClient's timeout only covers MQTT packets. WiFiClient uses seconds
-  // here and applies this limit to the TCP connection as well.
-  g_mqttSocket.setTimeout(1);
+  // Restore the ESP32 core's normal 3-second TCP connection deadline.
+  // MQTT reads remain bounded separately; short WLAN delays are not fatal.
+  g_mqttSocket.setTimeout(3);
+  feedLoopWDT();
 
   const String willTopic = mqttTopic("status/online");
   bool connected = false;
@@ -1385,25 +1542,25 @@ void ensureMqtt() {
   } else {
     connected = g_mqttClient.connect(dfrcfg::kMqttClientId, willTopic.c_str(), 1, true, "false");
   }
+  feedLoopWDT();
   if (!connected) {
+    g_lastMqttFailurePhase = "connect";
+    g_lastMqttAttemptMs = millis();
     g_mqttSocket.stop();
     statusf("mqtt connect failed rc=%d", g_mqttClient.state());
     return;
   }
 
-  g_mqttAttemptCount = 0;
+  g_mqttSessionActive = true;
+  g_mqttConnectedAtMs = millis();
+  g_nextMqttSubscription = 0;
   if (g_mqttEverConnected) ++g_mqttReconnectCount;
   g_mqttEverConnected = true;
-  g_mqttSocket.setNoDelay(true);
+  // MQTT consists of many tiny messages. Allow TCP to coalesce them instead
+  // of consuming one lwIP queue entry per small status message.
+  g_mqttSocket.setNoDelay(false);
+  g_statusSendStarted = false;
 
-  g_mqttClient.subscribe(mqttTopic("cmd/start").c_str(), 1);
-  g_mqttClient.subscribe(mqttTopic("cmd/stop").c_str(), 1);
-  g_mqttClient.subscribe(mqttTopic("cmd/restart").c_str(), 1);
-  g_mqttClient.subscribe(mqttTopic("cmd/ping").c_str(), 1);
-  g_mqttClient.subscribe(mqttTopic("cmd/set").c_str(), 1);
-  g_mqttClient.subscribe(mqttTopic("cmd/timelapse/start").c_str(), 1);
-  g_mqttClient.subscribe(mqttTopic("cmd/timelapse/stop").c_str(), 1);
-  g_mqttClient.subscribe(mqttTopic("cmd/timelapse/set").c_str(), 1);
   statusf("mqtt connected topic=%s", dfrcfg::kMqttBaseTopic);
   publishStatus(true);
 }
@@ -1506,6 +1663,7 @@ void setupController() {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.onEvent(onWifiEvent);
+  g_mqttSocket.setWaitCallback(serviceMqttWriteWait);
   g_mqttClient.setServer(dfrcfg::kMqttHost, dfrcfg::kMqttPort);
   g_mqttClient.setCallback(mqttCallback);
   g_mqttClient.setSocketTimeout(1);
@@ -1528,6 +1686,7 @@ void loopController() {
   }
   dfrvictron::loop();
   ensureMqtt();
+  flushStatus();
   ensureVictron();
   handlePendingMqttMessage();
   if (g_otaReady) ArduinoOTA.handle();
