@@ -113,6 +113,23 @@ camera/pi-zero-01
 }
 ```
 
+MQTT accepts only `width`, `height`, `framerate`, `bitrate`, `sharpness`,
+`brightness`, `contrast`, `saturation`, and the capture aliases
+`server_capture_enabled` / `server_capture_interval_seconds`
+(`timelapse_enabled` / `timelapse_interval_seconds` remain compatible).
+Executable paths, host, port, stream path, transport, codec, preview and inline
+header options can only be changed in the local configuration file. Unknown
+fields, duplicate JSON keys, conflicting aliases and invalid values reject the
+entire command without changing settings or restarting the stream. Command
+errors are reported through `status/error`; they do not disable the watchdog.
+The Node webserver's `_request_id` is accepted as metadata (1..128 ASCII letters,
+digits, hyphens, underscores or dots). It is never stored as a camera setting.
+
+Publish commands with `retain=false`. Retained messages replayed by the broker
+on subscription are rejected to prevent old start/stop/settings commands from
+being applied again after reconnecting. This is not MQTT publisher authentication;
+broker permissions still determine who can control the camera.
+
 ### Timelapse commands
 
 - `camera/pi-zero-01/cmd/timelapse/start`
@@ -160,10 +177,17 @@ Actual archive usage and capture results are published by the Node server below 
   of up to 30 seconds; a successful process start alone does not reset it.
 - MQTT callbacks enqueue commands (maximum 32 pending, 8192 bytes each) instead
   of stopping processes or saving settings on the network thread.
+- Command execution is limited to at most five commands per second. Excess
+  commands are rejected when the queue is full.
 - Unchanged retained status values and settings writes are suppressed. Changed
   settings are flushed to a temporary file and atomically replace the config.
 - SIGTERM/SIGINT shut down camera, FFmpeg and MQTT cleanly. The service example
   allows 50 seconds and also terminates child processes in its control group.
+- Main monitors the command worker and stream supervisor. A dead worker or one
+  that has not progressed for 60 seconds causes a nonzero service exit after
+  bounded shutdown. Repeated incomplete stream cleanup also escalates after
+  60 seconds. The example systemd unit restarts the failed service and cleans
+  up its child processes; a manually launched controller must be restarted.
 
 ## systemd
 

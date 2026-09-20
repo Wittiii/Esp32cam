@@ -187,6 +187,31 @@ class StreamerTests(StreamerFixture, unittest.TestCase):
         self.assertIsNone(self.streamer._capture_process)
         self.assertTrue(process.stdout.closed)
 
+    def test_persistent_cleanup_failure_escalates_instead_of_retrying_forever(self):
+        reader = MagicMock()
+        reader.is_alive.return_value = True
+        self.streamer._stderr_threads = [reader]
+        with patch.object(camera.time, "monotonic", return_value=100):
+            self.assertFalse(self.streamer.stop())
+        with patch.object(camera.time, "monotonic", return_value=161):
+            with self.assertRaisesRegex(RuntimeError, "cleanup timed out"):
+                self.streamer.stop()
+
+    def test_unkillable_child_is_not_forgotten_or_replaced(self):
+        process = MagicMock()
+        process.poll.return_value = None
+        process.wait.side_effect = camera.subprocess.TimeoutExpired("camera", 5)
+        self.streamer._capture_process = process
+        with self.assertRaisesRegex(RuntimeError, "SIGKILL"):
+            self.streamer.stop()
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        self.assertIs(self.streamer._capture_process, process)
+        with patch.object(camera.subprocess, "Popen") as spawn:
+            with self.assertRaises(RuntimeError):
+                self.streamer.start()
+            spawn.assert_not_called()
+
     @unittest.skipIf(os.name == "nt", "select() on pipes is a POSIX runtime feature")
     def test_eof_reports_error_without_accessing_cleared_global_handles(self):
         read_fd, write_fd = os.pipe()
@@ -228,6 +253,76 @@ class MqttTests(StreamerFixture, unittest.TestCase):
         self.assertEqual(self.streamer.settings.ffmpeg_path, "ffmpeg")
         self.assertEqual(self.streamer.settings.framerate, 20)
         self.assertIn("local configuration", self.controller._command_error)
+
+    def test_only_camera_fields_are_remotely_writable_and_rejection_is_atomic(self):
+        for key, value in {"host": "other-host", "port": 9999, "path": "other",
+                           "mode": "tcp", "codec": "mjpeg", "transport": "udp",
+                           "nopreview": False, "inline_headers": False,
+                           "command": "reboot", "unknown": True}.items():
+            with self.subTest(key=key):
+                before = self.path.read_bytes()
+                self.controller._execute_command("camera/test/cmd/set", json.dumps({key: value, "framerate": 10}).encode())
+                self.assertTrue(self.controller._command_error)
+                self.assertEqual(self.streamer.settings.framerate, 20)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_malformed_commands_preserve_stream_and_watchdog_and_next_command_works(self):
+        self.streamer._stream_state = "streaming"
+        self.streamer._stream_started_monotonic = time.monotonic() - 30
+        for payload in (b'{', b'[]', b'null', b'\xff', b'{"framerate":NaN}',
+                        b'{"framerate":10,"framerate":20}',
+                        b'{"server_capture_enabled":true,"timelapse_enabled":false}'):
+            with self.subTest(payload=payload):
+                self.controller._execute_command("camera/test/cmd/set", payload)
+                self.assertTrue(self.controller._command_error)
+                self.assertEqual(self.streamer.state, "streaming")
+                self.assertTrue(self.streamer.is_stalled())
+        self.controller._execute_command("camera/test/cmd/set", b'{"framerate":15}')
+        self.assertEqual(self.controller._command_error, "")
+        self.assertEqual(self.streamer.settings.framerate, 15)
+
+    def test_retained_command_replay_is_rejected(self):
+        self.controller._on_message(self.client, None, SimpleNamespace(
+            topic="camera/test/cmd/restart", payload=b"", retain=True))
+        self.assertTrue(self.controller._commands.empty())
+        self.assertIn("retained", self.controller._command_error)
+
+    def test_node_request_metadata_is_accepted_but_never_persisted(self):
+        self.controller._execute_command("camera/test/cmd/set", json.dumps({
+            "width": 1280, "height": 720, "framerate": 15, "bitrate": 2500000,
+            "sharpness": 1, "brightness": 0, "contrast": 1, "saturation": 1,
+            "server_capture_enabled": True, "server_capture_interval_seconds": 60,
+            "_request_id": "6910c905-4d42-431a-b03f-895ce71d61e5",
+        }).encode())
+        self.assertEqual(self.controller._command_error, "")
+        self.assertEqual(self.streamer.settings.framerate, 15)
+        self.assertTrue(self.streamer.server_capture_settings.enabled)
+        self.assertNotIn("_request_id", self.path.read_text())
+
+    def test_request_metadata_does_not_allow_unsafe_settings_or_invalid_ids(self):
+        for extra in ({"ffmpeg_path": "/tmp/program", "_request_id": "valid-id"},
+                      {"_request_id": {}}, {"_request_id": "x" * 129},
+                      {"_request_id": "bad\nvalue"}):
+            with self.subTest(extra=extra):
+                before = self.path.read_bytes()
+                self.controller._execute_command("camera/test/cmd/set", json.dumps({"framerate": 10, **extra}).encode())
+                self.assertTrue(self.controller._command_error)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_invalid_capture_command_preserves_capture_state(self):
+        self.streamer.enable_server_capture()
+        self.controller._execute_command("camera/test/cmd/timelapse/set", b'{"interval_seconds":0}')
+        self.assertEqual(self.streamer.capture_request_state, "enabled")
+        self.assertEqual(self.streamer.server_capture_settings.interval_seconds, 60)
+
+    def test_dead_or_stuck_command_worker_triggers_service_recovery(self):
+        with self.assertRaises(RuntimeError):
+            self.controller.check_health()
+        with patch.object(self.controller._worker, "is_alive", return_value=True):
+            self.controller.check_health()
+            self.controller._heartbeat = time.monotonic() - 61
+            with self.assertRaises(RuntimeError):
+                self.controller.check_health()
 
     def test_false_capture_alias_is_false_and_entire_command_is_validated_first(self):
         self.streamer.enable_server_capture()
@@ -318,6 +413,16 @@ class MqttTests(StreamerFixture, unittest.TestCase):
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_dead_or_stuck_supervisor_triggers_service_recovery(self):
+        supervisor = camera.StreamSupervisor(MagicMock())
+        with self.assertRaises(RuntimeError):
+            supervisor.check_health()
+        with patch.object(supervisor._thread, "is_alive", return_value=True):
+            supervisor.check_health()
+            supervisor._heartbeat = time.monotonic() - 61
+            with self.assertRaises(RuntimeError):
+                supervisor.check_health()
+
     def test_failed_stop_keeps_error_state_and_prevents_restart_until_cleanup_finishes(self):
         for desired in (False, True):
             with self.subTest(desired_running=desired):
