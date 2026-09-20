@@ -79,8 +79,11 @@ class BoundedMqttSocket : public WiFiClient {
   size_t fail(FailureReason reason, int errorNumber, uint32_t startedAt,
               size_t sentBytes, size_t totalBytes) {
     if (failureCount_ != UINT32_MAX) ++failureCount_;
-    lastFailure_ = {reason, errorNumber,
-                    static_cast<uint32_t>(millis() - startedAt), sentBytes, totalBytes};
+    lastFailure_.reason = reason;
+    lastFailure_.errorNumber = errorNumber;
+    lastFailure_.elapsedMs = static_cast<uint32_t>(millis() - startedAt);
+    lastFailure_.sentBytes = sentBytes;
+    lastFailure_.totalBytes = totalBytes;
     // The peer may already have a packet prefix. Only a new connection can
     // safely carry the next MQTT packet after a timeout or failed partial write.
     // Keep diagnostics in RAM across stop(), reconnect and successful writes.

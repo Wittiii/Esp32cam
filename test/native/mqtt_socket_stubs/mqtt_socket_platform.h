@@ -6,10 +6,10 @@
 #include <functional>
 
 namespace mqttsocketstub {
-inline uint32_t nowMs = 0;
-inline unsigned delays = 0;
-inline unsigned sends = 0;
-inline std::function<std::ptrdiff_t(int, const uint8_t *, size_t, int)> sendHandler;
+static uint32_t nowMs = 0;
+static unsigned delays = 0;
+static unsigned sends = 0;
+static std::function<std::ptrdiff_t(int, const uint8_t *, size_t, int)> sendHandler;
 
 inline void reset(uint32_t now = 0) {
   nowMs = now;

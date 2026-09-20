@@ -20,14 +20,19 @@ def main():
             "victron": ["-Itest/native/victron_stubs", "-Iinclude", "test/native/test_victron.cpp"],
             "control_payload": ["-Iinclude", "test/native/test_control_payload.cpp"],
             "camera_gain": ["-Iinclude", "test/native/test_camera_gain.cpp"],
+            "mqtt_socket": ["-Itest/native/mqtt_socket_stubs", "-Iinclude", "test/native/test_mqtt_socket.cpp"],
+            "mqtt_status_batch": ["-Iinclude", "test/native/test_mqtt_status_batch.cpp"],
             "server_capture": ["-Itest/native/capture_stubs", "-Iinclude", "test/native/test_server_capture.cpp",
                                "src/dfr1154_server_capture.cpp"],
         }
         for name, arguments in cases.items():
             binary = str(Path(temporary) / (name + extension))
-            subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-O1", *arguments, "-o", binary], cwd=ROOT, check=True)
+            # The DFR Arduino core compiles C++11. Exercise the new MQTT
+            # production headers with that same language level on the host.
+            standard = "c++11" if name.startswith("mqtt_") else "c++17"
+            subprocess.run([compiler, "-std=" + standard, "-Wall", "-Wextra", "-O1", *arguments, "-o", binary], cwd=ROOT, check=True)
             result = subprocess.run([binary], cwd=ROOT, check=True, capture_output=True, text=True, timeout=15)
-            print(name + ": " + result.stdout.strip().splitlines()[-1])
+            print(name + ": " + result.stdout.strip().splitlines()[-1], flush=True)
 
 if __name__ == "__main__":
     main()

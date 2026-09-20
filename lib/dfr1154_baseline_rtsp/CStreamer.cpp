@@ -106,7 +106,7 @@ int CStreamer::SendRtpPacket(unsigned const char * jpeg, int jpegLen, int fragme
 
     if (streamingSessionCount() == 0)
     {
-        return isLastFragment ? 0 : fragmentOffset;
+        return 0;
     }
 
     // Do we have custom quant tables? If so include them per RFC

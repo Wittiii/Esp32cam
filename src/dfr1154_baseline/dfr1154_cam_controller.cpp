@@ -22,6 +22,7 @@
 #include <time.h>
 
 #include "camera_common.h"
+#include "dfr1154_camera_gain.h"
 #include "dfr1154_config.h"
 #include "dfr1154_environment.h"
 #include "dfr1154_pins.h"
@@ -68,7 +69,7 @@ int g_ledEnabled = 0;
 int g_streamFps = dfrcfg::kDefaultRtspFps;
 
 // OV3660 controls exposed by DFRobot's CameraWebServer example.
-int g_gainCeiling = 0;
+int g_gainCeiling = dfrcamgain::kDefaultIndex;
 int g_colorbar = 0;
 int g_awb = 1;
 int g_agc = 1;
@@ -308,8 +309,8 @@ void rebuildStreamer() {
   esp_camera_fb_return(probe);
 
   g_streamer.reset(new Esp32RtspStreamer(width, height));
-  // Match the proven Micro-RTSP transport used before the reconnect changes.
-  g_streamer->setNonBlockingTcpWrites(false);
+  g_streamer->setNonBlockingTcpWrites(true);
+  g_streamer->setServiceCallback(serviceMqttDuringRtspWrite);
   g_streamer->setServiceCallback(serviceMqttDuringRtspWrite);
   const String hostPort = WiFi.localIP().toString() + ":" + String(dfrcfg::kRtspPort);
   g_streamer->setURI(hostPort, dfrcfg::kRtspPresentation, dfrcfg::kRtspStream);
@@ -431,6 +432,10 @@ String buildConfigJson() {
   json += ",\"saturation\":" + String(g_saturation);
   json += ",\"sharpness\":" + String(g_sharpness);
   json += ",\"gainceiling\":" + String(g_gainCeiling);
+  uint16_t gainRaw = 0;
+  if (dfrcamgain::rawLimit(g_gainCeiling, gainRaw)) {
+    json += ",\"gainceiling_raw\":" + String(gainRaw);
+  }
   json += ",\"colorbar\":" + String(g_colorbar);
   json += ",\"awb\":" + String(g_awb);
   json += ",\"agc\":" + String(g_agc);
@@ -551,7 +556,6 @@ void saveControllerSettings() {
 
 void loadControllerSettings() {
   const uint8_t configVersion = g_preferences.getUChar("cfgver", 0);
-  const bool alignDfrDefaults = configVersion < 2;
   g_frameSize = frameSizeFromIndex(clampValue(g_preferences.getInt("framesize", 6), 0, 7));
   g_jpegQuality = clampValue(g_preferences.getInt("quality", 10), 4, 63);
   g_streamFps = clampValue(g_preferences.getInt("fps", dfrcfg::kDefaultRtspFps), 1, 20);
@@ -559,7 +563,9 @@ void loadControllerSettings() {
   g_contrast = clampValue(g_preferences.getInt("contrast", 0), -2, 2);
   g_saturation = clampValue(g_preferences.getInt("saturate", -2), -2, 2);
   g_sharpness = clampValue(g_preferences.getInt("sharp", 0), -2, 2);
-  g_gainCeiling = clampValue(g_preferences.getInt("gainceil", 0), 0, 6);
+  const bool gainSettingExists = g_preferences.isKey("gainceil");
+  const int storedGainIndex = g_preferences.getInt("gainceil", -1);
+  g_gainCeiling = dfrcamgain::loadIndex(storedGainIndex, gainSettingExists, configVersion);
   g_colorbar = g_preferences.getInt("colorbar", 0) ? 1 : 0;
   g_awb = g_preferences.getInt("awb", 1) ? 1 : 0;
   g_agc = g_preferences.getInt("agc", 1) ? 1 : 0;
@@ -585,20 +591,18 @@ void loadControllerSettings() {
   g_irOffAboveLux = g_preferences.getFloat("irofflux", dfrcfg::kDefaultIrOffAboveLux);
   if (g_irOffAboveLux <= g_irOnBelowLux) g_irOffAboveLux = g_irOnBelowLux + 2.0f;
 
-  // Match DFRobot's CameraWebServer defaults once; later user changes remain persistent.
-  if (alignDfrDefaults) {
-    g_frameSize = FRAMESIZE_UXGA;
-    g_jpegQuality = 10;
-    g_brightness = 1;
-    g_contrast = 0;
-    g_saturation = -2;
-    g_sharpness = 0;
-    g_vflip = 1;
-    saveControllerSettings();
-  }
-  if (configVersion < 3) {
-    saveControllerSettings();
-    g_preferences.putUChar("cfgver", 3);
+  // Keep all saved settings when returning to the baseline. Migrate only
+  // the old gain selection; cfgver >= 4 keeps a deliberate index 0 intact.
+  if (!dfrcamgain::persistMigration(
+          configVersion,
+          [&]() {
+            return (gainSettingExists && storedGainIndex == g_gainCeiling) ||
+                g_preferences.putInt("gainceil", g_gainCeiling) == sizeof(int32_t);
+          },
+          [&](uint8_t version) {
+            return g_preferences.putUChar("cfgver", version) == sizeof(uint8_t);
+          })) {
+    setError("gain ceiling migration could not be saved; will retry after restart");
   }
 }
 
@@ -622,7 +626,10 @@ bool applySensorSettings(bool rebuildAfter) {
   check(sensor->set_contrast(sensor, g_contrast), "contrast");
   check(sensor->set_saturation(sensor, g_saturation), "saturation");
   check(sensor->set_sharpness(sensor, g_sharpness), "sharpness");
-  check(sensor->set_gainceiling(sensor, static_cast<gainceiling_t>(g_gainCeiling)), "gainceiling");
+  const bool gainApplied = dfrcamgain::applyGainCeiling(g_gainCeiling, [&](uint16_t raw) {
+    return sensor->set_gainceiling(sensor, static_cast<gainceiling_t>(raw)) == 0;
+  });
+  check(gainApplied ? 0 : -1, "gainceiling");
   check(sensor->set_colorbar(sensor, g_colorbar), "colorbar");
   check(sensor->set_whitebal(sensor, g_awb), "awb");
   check(sensor->set_gain_ctrl(sensor, g_agc), "agc");
@@ -899,7 +906,7 @@ bool extractPayloadInt(const String &payload, const char *key, int &value) {
   return camcommon::extractPayloadInt(payload, key, value);
 }
 
-enum class SettingResult { unsupported, unchanged, applied, failed };
+enum class SettingResult { unsupported, unchanged, applied, failed, invalid };
 
 template <typename Value>
 bool applySensorControl(
@@ -964,11 +971,13 @@ SettingResult applySetting(const char *key, int value, bool &streamRebuildRequir
     if (!requireSensor() || !applySensorControl(sensor, sensor->set_sharpness, bounded, key)) return SettingResult::failed;
     g_sharpness = bounded;
   } else if (strcmp(key, "gainceiling") == 0) {
-    const int bounded = clampValue(value, 0, 6);
-    if (bounded == g_gainCeiling) return SettingResult::unchanged;
-    const auto gain = static_cast<gainceiling_t>(bounded);
-    if (!requireSensor() || !applySensorControl(sensor, sensor->set_gainceiling, gain, key)) return SettingResult::failed;
-    g_gainCeiling = bounded;
+    if (!dfrcamgain::validIndex(value)) return SettingResult::invalid;
+    if (value == g_gainCeiling) return SettingResult::unchanged;
+    if (!requireSensor() || !dfrcamgain::applyGainCeiling(value, [&](uint16_t raw) {
+          return applySensorControl(sensor, sensor->set_gainceiling,
+                                    static_cast<gainceiling_t>(raw), key);
+        })) return SettingResult::failed;
+    g_gainCeiling = value;
   } else if (strcmp(key, "colorbar") == 0) {
     const int bounded = value ? 1 : 0;
     if (bounded == g_colorbar) return SettingResult::unchanged;
@@ -1121,10 +1130,11 @@ void applyControlPayload(const String &payload) {
     const SettingResult result = applySetting(key, value, streamRebuildRequired);
     if (result != SettingResult::unsupported) recognized = true;
     if (result == SettingResult::applied) changed = true;
-    if (result == SettingResult::failed) {
+    if (result == SettingResult::failed || result == SettingResult::invalid) {
       failed = true;
       if (failedSettings.length() > 0) failedSettings += ",";
       failedSettings += key;
+      if (result == SettingResult::invalid) failedSettings += " (expected index 0..5)";
     }
   }
 

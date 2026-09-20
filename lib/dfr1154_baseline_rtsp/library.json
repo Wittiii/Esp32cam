@@ -1,0 +1,6 @@
+{
+  "name": "dfr1154_baseline_rtsp",
+  "version": "0.0.1",
+  "description": "DFR-only RTSP baseline copied from commit 1633cc5",
+  "build": { "srcDir": ".", "includeDir": "." }
+}

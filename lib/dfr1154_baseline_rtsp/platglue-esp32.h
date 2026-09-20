@@ -69,22 +69,11 @@ inline ssize_t socketsend(SOCKET sockfd, const void *buf, size_t len)
 // session is closed and allowed to reconnect instead.
 inline ssize_t sockettrysend(SOCKET sockfd, const void *buf, size_t len)
 {
-    if (!sockfd || !sockfd->connected() || sockfd->fd() < 0) return -1;
+    if (!sockfd || !sockfd->connected()) return -1;
 
-    const uint8_t *bytes = static_cast<const uint8_t *>(buf);
-    size_t totalSent = 0;
-    const uint32_t startedAt = millis();
-    while (totalSent < len && millis() - startedAt < 100) {
-        const ssize_t sent = ::send(
-            sockfd->fd(), bytes + totalSent, len - totalSent, MSG_DONTWAIT);
-        if (sent > 0) {
-            totalSent += static_cast<size_t>(sent);
-            continue;
-        }
-        if (sent == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
-        delay(1);
-    }
-    if (totalSent == len) return static_cast<ssize_t>(totalSent);
+    sockfd->setTimeout(1);
+    const size_t sent = sockfd->write(static_cast<const uint8_t *>(buf), len);
+    if (sent == len) return static_cast<ssize_t>(sent);
     sockfd->stop();
     return -1;
 }
