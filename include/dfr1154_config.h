@@ -19,7 +19,7 @@ using dfrsecrets::kMqttPassword;
 using dfrsecrets::kMqttUsername;
 constexpr char kMqttClientId[] = "dfr1154-cam-01";
 constexpr char kMqttBaseTopic[] = "camera/dfr1154-cam-01";
-constexpr char kFirmwareVersion[] = "2026.08.30-dfr-nimble1";
+constexpr char kFirmwareVersion[] = "21.09-Testing-performance";
 
 constexpr uint16_t kRtspPort = 8554;
 constexpr char kRtspPresentation[] = "mjpeg";

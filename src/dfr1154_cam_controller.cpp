@@ -23,6 +23,7 @@
 
 #include "camera_common.h"
 #include "dfr1154_config.h"
+#include "dfr1154_diagnostics.h"
 #include "dfr1154_environment.h"
 #include "dfr1154_pins.h"
 #include "dfr1154_server_capture.h"
@@ -202,6 +203,7 @@ const char *resetReasonName(esp_reset_reason_t reason) {
 }
 
 void serviceMqttDuringRtspWrite() {
+  dfrdiag::Scope diagnostic("serviceMqttDuringRtspWrite");
   if (g_mqttClient.connected()) g_mqttClient.loop();
   feedLoopWDT();
   delay(0);
@@ -287,6 +289,7 @@ bool readAmbientLuxNow() {
 }
 
 void handleLightSensor() {
+  dfrdiag::Scope diagnostic("handleLightSensor");
   if (!g_lightReady) return;
   const uint32_t now = millis();
   if (now - g_lastLightReadMs < dfrcfg::kLightReadIntervalMs) return;
@@ -295,6 +298,7 @@ void handleLightSensor() {
 }
 
 void rebuildStreamer() {
+  dfrdiag::Scope diagnostic("rebuildStreamer");
   g_streamer.reset();
   if (!g_cameraReady || !g_streamEnabled || WiFi.status() != WL_CONNECTED) return;
 
@@ -324,6 +328,7 @@ void ensureRtspServer() {
 }
 
 void publishSimple(const char *suffix, const String &value, bool retain = true) {
+  dfrdiag::Scope diagnostic(suffix);
   if (g_mqttClient.connected()) {
     feedLoopWDT();
     if (!g_mqttClient.publish(mqttTopic(suffix).c_str(), value.c_str(), retain)) {
@@ -335,6 +340,7 @@ void publishSimple(const char *suffix, const String &value, bool retain = true) 
 }
 
 void publishExternalSensors() {
+  dfrdiag::Scope diagnostic("publishExternalSensors");
   static bool bmePublishScheduleStarted = false;
   static uint32_t lastBmePublishMs = 0;
   const uint32_t now = millis();
@@ -468,8 +474,26 @@ String buildConfigJson() {
 }
 
 void publishStatus(bool forceConfig) {
+  dfrdiag::Scope diagnostic("publishStatus");
   static String previousConfig;
   if (!g_mqttClient.connected()) return;
+
+  // Reuse the existing connection. No network access from a panic handler.
+  // Retry boot diagnostics on subsequent status cycles if publishing fails.
+  static bool bootDiagnosticsSent = false;
+  static bool diagnosticAttempted = false;
+  static uint32_t lastDiagnosticMs = 0;
+  const uint32_t diagnosticNow = millis();
+  if (!diagnosticAttempted || diagnosticNow - lastDiagnosticMs >= 30000UL) {
+    const String payload = bootDiagnosticsSent ? dfrdiag::timingReport() : dfrdiag::bootReport();
+    const char *suffix = bootDiagnosticsSent ? "status/diagnostics/timing" : "status/diagnostics/boot";
+    dfrdiag::Scope diagnosticWrite("mqtt_diagnostics_write");
+    lastDiagnosticMs = diagnosticNow;
+    diagnosticAttempted = true;
+    if (g_mqttClient.publish(mqttTopic(suffix).c_str(), payload.c_str(), true)) {
+      bootDiagnosticsSent = true;
+    }
+  }
 
   publishSimple("status/online", "true");
   publishSimple("status/state", streamState());
@@ -516,6 +540,7 @@ void publishStatus(bool forceConfig) {
 }
 
 void saveControllerSettings() {
+  dfrdiag::Scope diagnostic("saveControllerSettings");
   g_preferences.putInt("framesize", frameSizeToIndex(g_frameSize));
   g_preferences.putInt("quality", g_jpegQuality);
   g_preferences.putInt("fps", g_streamFps);
@@ -653,6 +678,7 @@ bool applySensorSettings(bool rebuildAfter) {
 }
 
 bool initCamera() {
+  dfrdiag::Scope diagnostic("initCamera");
   g_cameraReady = false;
   g_psramReady = psramFound();
   if (!g_psramReady) {
@@ -705,6 +731,7 @@ bool initCamera() {
 }
 
 void shutdownCamera() {
+  dfrdiag::Scope diagnostic("shutdownCamera");
   g_streamer.reset();
   if (!g_cameraReady) return;
   esp_camera_deinit();
@@ -712,6 +739,7 @@ void shutdownCamera() {
 }
 
 bool restartCameraPipeline() {
+  dfrdiag::Scope diagnostic("restartCameraPipeline");
   recordStatus("camera reconfiguring");
   shutdownCamera();
   delay(50);
@@ -732,6 +760,7 @@ void requestCameraRecovery(const String &reason) {
 }
 
 void handleCameraRecovery() {
+  dfrdiag::Scope diagnostic("handleCameraRecovery");
   const uint32_t now = millis();
   if (g_cameraReady && !g_cameraRecoveryPending) return;
   if (now - g_lastCameraRecoveryAttemptMs < 10000UL) return;
@@ -754,6 +783,7 @@ void handleCameraRecovery() {
 }
 
 void configureLightSensor() {
+  dfrdiag::Scope diagnostic("configureLightSensor");
   g_lightReady = false;
   g_ambientLux = NAN;
   g_lightReady = g_lightSensor.begin();
@@ -796,6 +826,7 @@ void configureOta() {
 }
 
 void configureMdns() {
+  dfrdiag::Scope diagnostic("configureMdns");
   if (g_mdnsReady || WiFi.status() != WL_CONNECTED) return;
   if (!MDNS.begin(dfrcfg::kMdnsHostname)) {
     recordStatus("mdns setup failed");
@@ -821,6 +852,7 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 }
 
 void handleWifiEvents() {
+  dfrdiag::Scope diagnostic("handleWifiEvents");
   if (g_wifiDisconnectedEvent) {
     g_wifiDisconnectedEvent = false;
     ++g_wifiReconnectCount;
@@ -859,6 +891,7 @@ void handleWifiEvents() {
 }
 
 void handleNetworkServices() {
+  dfrdiag::Scope diagnostic("handleNetworkServices");
   if (!g_networkServicesPending || WiFi.status() != WL_CONNECTED) return;
   g_networkServicesPending = false;
   configureMdns();
@@ -868,6 +901,7 @@ void handleNetworkServices() {
 }
 
 void ensureWifi() {
+  dfrdiag::Scope diagnostic("ensureWifi");
   if (WiFi.status() == WL_CONNECTED) return;
   const uint32_t now = millis();
   const uint32_t retryDelay = boundedReconnectDelay(
@@ -1229,6 +1263,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
 }
 
 void handlePendingMqttMessage() {
+  dfrdiag::Scope diagnostic("handlePendingMqttMessage");
   if (!g_pendingMqttMessage) return;
   const String topic = g_pendingMqttTopic;
   const String payload = g_pendingMqttPayload;
@@ -1239,6 +1274,7 @@ void handlePendingMqttMessage() {
 }
 
 void ensureMqtt() {
+  dfrdiag::Scope diagnostic("ensureMqtt");
   if (WiFi.status() != WL_CONNECTED) {
     if (g_mqttClient.connected()) g_mqttClient.disconnect();
     g_mqttSocket.stop();
@@ -1305,6 +1341,7 @@ void ensureMqtt() {
 }
 
 void handleRtspLoop() {
+  dfrdiag::Scope diagnostic("handleRtspLoop");
   if (WiFi.status() != WL_CONNECTED || !g_cameraReady) return;
   if (!g_streamEnabled) {
     WiFiClient waitingClient = g_rtspServer.accept();
@@ -1314,12 +1351,12 @@ void handleRtspLoop() {
   if (g_streamer == nullptr) rebuildStreamer();
   if (g_streamer == nullptr) return;
 
-  g_streamer->handleRequests(0);
+  { dfrdiag::Scope diagnostic("rtsp_requests"); g_streamer->handleRequests(0); }
   const uint32_t now = millis();
   const uint32_t frameIntervalMs = 1000UL / static_cast<uint32_t>(max(1, g_streamFps));
   if (g_streamer->anySessions() &&
       (now - g_lastFrameAtMs >= frameIntervalMs || now < g_lastFrameAtMs)) {
-    g_streamer->streamImage(now);
+    { dfrdiag::Scope diagnostic("rtsp_capture_and_send"); g_streamer->streamImage(now); }
     g_lastFrameAtMs = now;
     if (g_streamer->lastFrameSucceeded()) {
       ++g_framesSent;
@@ -1358,13 +1395,14 @@ void updateRuntimeStats() {
 }
 
 void ensureVictron() {
+  dfrdiag::Scope diagnostic("ensureVictron");
   if (g_victronBeginAttempted || !dfrcfg::kVictronEnabled) return;
   if (millis() < dfrcfg::kVictronStartDelayMs) return;
   if (WiFi.status() != WL_CONNECTED || !g_mqttClient.connected()) return;
 
   g_victronBeginAttempted = true;
   recordStatus("victron BLE initializing");
-  dfrvictron::begin();
+  { dfrdiag::Scope diagnostic("victron_begin"); dfrvictron::begin(); }
 }
 
 }  // namespace
@@ -1375,6 +1413,7 @@ void setupController() {
   Serial.begin(115200);
   delay(500);
   g_bootResetReason = esp_reset_reason();
+  dfrdiag::begin(g_bootResetReason);
   Serial.println("\n[BOOT] DFR1154 camera controller starting");
 
   pinMode(DFR_LED_PIN, OUTPUT);
@@ -1388,7 +1427,7 @@ void setupController() {
   loadControllerSettings();
   initCamera();
   configureLightSensor();
-  dfrbme::begin();
+  { dfrdiag::Scope diagnostic("bme_begin"); dfrbme::begin(); }
   dfrcapture::begin();
 
   statusf(
@@ -1407,8 +1446,8 @@ void setupController() {
 }
 
 void loopController() {
-  if (g_otaReady) ArduinoOTA.handle();
-  dfrbme::loop();
+  if (g_otaReady) { dfrdiag::Scope diagnostic("ota_handle"); ArduinoOTA.handle(); }
+  { dfrdiag::Scope diagnostic("bme_loop"); dfrbme::loop(); }
   handleWifiEvents();
   ensureWifi();
   handleNetworkServices();
@@ -1416,11 +1455,11 @@ void loopController() {
     delay(1);
     return;
   }
-  dfrvictron::loop();
+  { dfrdiag::Scope diagnostic("victron_loop"); dfrvictron::loop(); }
   ensureMqtt();
   ensureVictron();
   handlePendingMqttMessage();
-  if (g_otaReady) ArduinoOTA.handle();
+  if (g_otaReady) { dfrdiag::Scope diagnostic("ota_handle"); ArduinoOTA.handle(); }
   handleCameraRecovery();
   handleLightSensor();
   handleRtspLoop();

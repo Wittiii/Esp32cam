@@ -1,5 +1,6 @@
 #include "CStreamer.h"
 #include "CRtspSession.h"
+#include "../../include/dfr1154_trace_scope.h"
 
 #include <stdio.h>
 
@@ -418,6 +419,7 @@ void  nextJpegBlock(BufPtr *bytes) {
 // This function fixes up the provided start ptr to point to the
 // actual JPEG stream data and returns the number of bytes skipped
 bool decodeJPEGfile(BufPtr *start, uint32_t *len, BufPtr *qtable0, BufPtr *qtable1) {
+    DFR_DIAGNOSTIC_SCOPE("jpeg_decode");
     // per https://en.wikipedia.org/wiki/JPEG_File_Interchange_Format
     unsigned const char *bytes = *start;
 

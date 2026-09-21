@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include "../../include/dfr1154_trace_scope.h"
 
 
 typedef WiFiClient *SOCKET;
@@ -61,6 +62,7 @@ inline UDPSOCKET udpsocketcreate(unsigned short portNum)
 // TCP sending
 inline ssize_t socketsend(SOCKET sockfd, const void *buf, size_t len)
 {
+    DFR_DIAGNOSTIC_SCOPE("rtsp_tcp_write");
     return sockfd->write((uint8_t *) buf, len);
 }
 
@@ -69,6 +71,7 @@ inline ssize_t socketsend(SOCKET sockfd, const void *buf, size_t len)
 // session is closed and allowed to reconnect instead.
 inline ssize_t sockettrysend(SOCKET sockfd, const void *buf, size_t len)
 {
+    DFR_DIAGNOSTIC_SCOPE("rtsp_tcp_trywrite");
     if (!sockfd || !sockfd->connected() || sockfd->fd() < 0) return -1;
 
     const uint8_t *bytes = static_cast<const uint8_t *>(buf);
@@ -92,6 +95,7 @@ inline ssize_t sockettrysend(SOCKET sockfd, const void *buf, size_t len)
 inline ssize_t udpsocketsend(UDPSOCKET sockfd, const void *buf, size_t len,
                              IPADDRESS destaddr, IPPORT destport)
 {
+    DFR_DIAGNOSTIC_SCOPE("rtsp_udp_write");
     sockfd->beginPacket(destaddr, destport);
     sockfd->write((const uint8_t *)  buf, len);
     if(!sockfd->endPacket())
