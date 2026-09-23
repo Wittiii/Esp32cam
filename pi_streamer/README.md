@@ -244,6 +244,53 @@ The streamer uses plain MQTT and the camera's RTSP endpoint has no authenticatio
 neither should be forwarded directly to the Internet. Removing a config from Git
 does not remove earlier commits: rotate credentials if they were exposed.
 
+## Local diagnostics after a failure
+
+The controller automatically writes `logs/controller.log` beside its config file,
+including camera/FFmpeg output, errors, Python exception traces and a stream-health
+snapshot every minute. Detected controller/worker health failures also record the
+Python stacks of all threads before shutdown. Logging keeps four rotated files
+of approximately 2 MiB each plus the active file (approximately 10 MiB total).
+Use `--log-dir /path` for a different directory; this is a local startup option,
+not an MQTT setting. File logging falls back to the system journal/console if
+the directory cannot be written; after a write failure it retries on service restart.
+
+After updating the code, enable persistent **system-wide** journal storage once,
+then restart the camera service (your existing service paths remain valid):
+
+```bash
+bash pi_streamer/enable_pi_diagnostics.sh
+sudo systemctl restart pi-cam-controller
+tail -n 80 pi_streamer/logs/controller.log
+```
+
+The script installs `/etc/systemd/journald.conf.d/60-pi-camera.conf`. It sets a
+64 MiB journal retention target, reserves 256 MiB of free space, and retains at
+most seven days. Active journal files can exceed the target. These limits apply
+to all system logs, so kernel and network failures can be examined too. Existing
+local journald overrides may affect the effective settings. Normal journal data
+is synchronized every 30 seconds; abrupt power loss can still lose recent entries.
+No logger can record events while the kernel or storage is completely stuck.
+Previously unrecorded boot logs cannot be recovered by enabling this now.
+
+After a problem (also after reboot), generate a text report from the repo root:
+
+```bash
+python3 pi_streamer/collect_diagnostics.py
+```
+
+Send the printed `pi_streamer/diagnostics/pi-diagnostics-*.txt` file for analysis.
+It includes the last 256 KiB of each application log and bounded journal excerpts
+from the current and previous boots, service restart counts, memory/disk usage,
+network state, temperature and power-throttling flags. Missing commands,
+insufficient permissions and command timeouts appear in the report. If journal
+access is denied, run the collector with `sudo` (the resulting report is then
+root-owned). Each command has a ten-second timeout. Use `--log-dir` if the service
+uses a custom log directory. Config files and MQTT passwords are not deliberately
+collected; review reports before sharing because logs can contain addresses,
+device names or sensitive error text. Reports are generated only on request and
+can be removed when no longer needed; automatic log rotation does not delete them.
+
 ## Tests
 
 See [test instructions](../test/README.md). Host tests use temporary configs and

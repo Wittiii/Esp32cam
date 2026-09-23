@@ -17,6 +17,11 @@ from typing import Any, Callable
 
 import paho.mqtt.client as mqtt
 
+if __package__:
+    from .local_diagnostics import configure_logging, log_thread_stacks
+else:
+    from local_diagnostics import configure_logging, log_thread_stacks
+
 
 LOG = logging.getLogger("pi-cam-controller")
 
@@ -1149,14 +1154,11 @@ def main() -> None:
     parser.add_argument("--config", default="pi_streamer/config.json", help="Path to the JSON config file")
     parser.add_argument("--autostart", action="store_true", help="Start the camera stream immediately")
     parser.add_argument("--log-level", default="INFO", help="Python log level")
+    parser.add_argument("--log-dir", help="Local log directory (default: logs beside config)")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
     config_path = Path(args.config).resolve()
+    configure_logging(Path(args.log_dir) if args.log_dir else config_path.parent / "logs", args.log_level)
     stream_settings, server_capture_settings, mqtt_settings = load_config(config_path)
     streamer = CameraStreamer(stream_settings, server_capture_settings, config_path)
     supervisor = StreamSupervisor(streamer)
@@ -1174,6 +1176,7 @@ def main() -> None:
         controller.start()
         supervisor.start(autostart=args.autostart)
         next_status_at = 0.0
+        next_diagnostic_at = 0.0
         while not shutdown.wait(1):
             supervisor.check_health()
             controller.check_health()
@@ -1181,9 +1184,19 @@ def main() -> None:
             if now >= next_status_at:
                 controller.publish_streamer_status()
                 next_status_at = now + 10.0
+            if now >= next_diagnostic_at:
+                LOG.info("Health: state=%s desired_running=%s reconnects=%s stream=%s",
+                         streamer.state, supervisor.desired_running,
+                         supervisor.reconnect_count, streamer.stream_health())
+                next_diagnostic_at = now + 60.0
     except KeyboardInterrupt:
         LOG.info("shutting down")
+    except Exception:
+        LOG.exception("Controller failed; collecting thread stacks before shutdown")
+        log_thread_stacks()
+        raise
     finally:
+        LOG.info("Controller stopping")
         controller.stop()
         supervisor.stop()
 
