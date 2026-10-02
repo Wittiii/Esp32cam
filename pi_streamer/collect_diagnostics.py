@@ -14,7 +14,9 @@ COMMANDS = (
     ("free", "-h"),
     ("df", "-h"),
     ("ip", "-brief", "address"),
+    ("ip", "route"),
     ("iw", "dev", "wlan0", "link"),
+    ("nmcli", "--terse", "--get-values", "GENERAL.STATE", "device", "show", "wlan0"),
     ("vcgencmd", "get_throttled"),
     ("vcgencmd", "measure_temp"),
     ("systemctl", "status", "pi-cam-controller", "--no-pager", "-l"),
@@ -24,7 +26,9 @@ COMMANDS = (
 ) + tuple(
     ("journalctl", "-b", boot, "--no-pager", "-n", "400", "-o", "short-iso") + scope
     for boot in ("0", "-1")
-    for scope in (("-u", "pi-cam-controller"), ("-k",), ("-p", "warning"))
+    for scope in (("-u", "pi-cam-controller"), ("-u", "NetworkManager"),
+                  ("-u", "pi-cam-wifi-watchdog"), ("--user-unit", "rpi-connect.service"),
+                  ("-k",), ("-p", "warning"))
 )
 
 

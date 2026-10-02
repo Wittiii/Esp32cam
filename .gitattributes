@@ -1,3 +1,5 @@
 # These files are executed/read on Linux, including after Windows checkouts.
 *.sh text eol=lf
 *.service.example text eol=lf
+*.service text eol=lf
+*.timer text eol=lf

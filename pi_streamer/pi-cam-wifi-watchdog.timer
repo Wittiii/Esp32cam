@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Raspberry Pi Wi-Fi recovery every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=pi-cam-wifi-watchdog.service
+
+[Install]
+WantedBy=timers.target

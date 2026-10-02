@@ -1,0 +1,12 @@
+[Unit]
+Description=Guarded Raspberry Pi Wi-Fi recovery check
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/pi-cam-wifi-watchdog.py
+StateDirectory=pi-cam-wifi-watchdog
+StateDirectoryMode=0700
+ProtectSystem=full
+NoNewPrivileges=true
+TimeoutStartSec=30s

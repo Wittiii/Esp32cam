@@ -291,6 +291,36 @@ collected; review reports before sharing because logs can contain addresses,
 device names or sensitive error text. Reports are generated only on request and
 can be removed when no longer needed; automatic log rotation does not delete them.
 
+### Automatic WLAN recovery
+
+On a Pi using NetworkManager, install the separate watchdog after updating the
+repository. It does not require or change the camera service or Node server:
+
+```bash
+bash pi_streamer/install_wifi_watchdog.sh
+systemctl status pi-cam-wifi-watchdog.timer --no-pager
+```
+
+Every minute it checks NetworkManager's `wlan0` state. After at least one hour
+of continuously reported disconnection, it requests **one** Pi reboot. The
+reboot decision is saved before the request; if Wi-Fi is still unavailable after
+boot, it will not reboot again. Ten minutes of stable connection are required
+before a future outage can trigger another reboot. A failed or unknown status
+check resets the one-hour timer rather than risking a false reboot. Timing uses
+the Pi's monotonic clock, so clock synchronization cannot shorten the hour.
+The monitor starts counting again after a manual reboot. This recovers some
+stuck Wi-Fi states; it cannot fix a router or password problem. Events appear in
+`journalctl -u pi-cam-wifi-watchdog.service --no-pager`. To disable it:
+
+```bash
+sudo systemctl disable --now pi-cam-wifi-watchdog.timer
+```
+
+The monitor runs from a root-owned copy in `/usr/local/lib`; after changing
+`wifi_watchdog.py` in the repo, rerun the installer. The diagnostic collector
+also includes recent NetworkManager, watchdog and Pi Connect journal entries
+from the current and previous boot for future network investigations.
+
 ## Tests
 
 See [test instructions](../test/README.md). Host tests use temporary configs and
